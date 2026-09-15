@@ -2,7 +2,7 @@ import express from 'express';
 import * as cheerio from 'cheerio';
 
 const app = express();
-const PORT = process.env.PORT || 7000;
+const PORT = Number(process.env.PORT) || 3000;
 const BASE = 'https://dramaexpress.net';
 const UA = 'Mozilla/5.0 (compatible; Nuvio-DramaExpress-Addon/1.2)';
 const CACHE_MS = 10 * 60 * 1000;
@@ -267,4 +267,4 @@ app.get('/stream/series/:id.json', async (req, res) => {
 
 app.get('/health', (_, res) => res.json({ ok:true, version:'1.3.0' }));
 app.get('/', (_, res) => res.type('text').send('Nuvio DramaExpress addon is running. Use /manifest.json'));
-app.listen(PORT, () => console.log(`DramaExpress addon listening on ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`DramaExpress addon listening on 0.0.0.0:${PORT}`));
