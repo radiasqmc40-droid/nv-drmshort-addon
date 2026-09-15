@@ -2,27 +2,62 @@ import express from 'express';
 import * as cheerio from 'cheerio';
 
 const app = express();
+const VERSION = '1.8.1';
 const PORT = Number(process.env.PORT) || 3000;
 const BASE = 'https://dramaexpress.net';
-const UA = 'Mozilla/5.0 (compatible; Nuvio-DramaExpress-Addon/1.8)';
+const UA = `Mozilla/5.0 (compatible; Nuvio-DramaExpress-Addon/${VERSION})`;
 const CACHE_MS = 10 * 60 * 1000;
-const FETCH_TIMEOUT_MS = 12000;
 const CATALOG_CACHE_MS = 30 * 60 * 1000;
 const DISCOVERY_CACHE_MS = 30 * 60 * 1000;
+const FETCH_TIMEOUT_MS = 12000;
+const PROBE_TIMEOUT_MS = 7000;
 const MAX_PAGE = 1000;
 const PAGE_SIZE = 100;
+const MAX_SCRIPT_FETCHES = 8;
+const MAX_API_FETCHES = 20;
+
+const htmlCache = new Map();
 const catalogCache = new Map();
-const cache = new Map();
 let discoveredCatalogs = null;
 let discoveredAt = 0;
 
-function slugifyId(s) {
-  return clean(s).toLowerCase().replace(/&/g, 'and').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+function clean(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
+function abs(u, base = BASE) { try { return new URL(u, base).href; } catch { return null; } }
+function slugFromUrl(u) { try { return new URL(u).pathname.split('/').filter(Boolean).pop() || ''; } catch { return ''; } }
+function idForUrl(u) { return `dex:${slugFromUrl(u)}`; }
+function decodeId(id) { try { return decodeURIComponent(id); } catch { return id; } }
+function seriesSlugFromId(id) { return decodeId(id).replace(/^dex:/, '').trim(); }
+function labelFromSlug(slug) { return clean(slug.replace(/[-_]+/g, ' ')).replace(/\b\w/g, c => c.toUpperCase()); }
+
+async function fetchText(url, extraHeaders = {}, cacheable = true) {
+  const key = `${url}|${extraHeaders.referer || ''}`;
+  const now = Date.now();
+  const hit = htmlCache.get(key);
+  if (cacheable && hit && now - hit.time < CACHE_MS) return hit.text;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const r = await fetch(url, {
+      headers: {
+        'user-agent': UA,
+        'accept-language': 'en-US,en;q=0.8',
+        accept: '*/*',
+        ...extraHeaders
+      },
+      redirect: 'follow',
+      signal: controller.signal
+    });
+    if (!r.ok) throw new Error(`Upstream ${r.status} for ${url}`);
+    const text = await r.text();
+    if (cacheable) htmlCache.set(key, { time: now, text });
+    return text;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-function labelFromSlug(slug) {
-  return clean(slug.replace(/[-_]+/g, ' ')).replace(/\b\w/g, c => c.toUpperCase());
-}
+async function fetchHtml(url, headers = {}) { return fetchText(url, headers, true); }
 
 async function discoverCatalogs(force = false) {
   const now = Date.now();
@@ -33,11 +68,12 @@ async function discoverCatalogs(force = false) {
     try {
       const u = new URL(href, BASE);
       const parts = u.pathname.split('/').filter(Boolean);
-      const index = parts[0] === 'category' || parts[0] === 'source' ? 0 : -1;
-      if (index < 0 || !parts[1]) return;
+      if (!['category', 'source'].includes(parts[0]) || !parts[1]) return;
       const slug = parts[1].toLowerCase();
       const id = type === 'category' ? slug : `source-${slug}`;
-      if (!found.has(id)) found.set(id, { id, type, path: `/${parts[0]}/${slug}`, name: clean(label) || labelFromSlug(slug) });
+      if (!found.has(id)) found.set(id, {
+        id, type, path: `/${parts[0]}/${slug}`, name: clean(label) || labelFromSlug(slug)
+      });
     } catch {}
   };
 
@@ -60,72 +96,40 @@ async function discoverCatalogs(force = false) {
   return discoveredCatalogs;
 }
 
-async function catalogIndex() {
-  return discoverCatalogs(false);
-}
-
-function abs(u) { try { return new URL(u, BASE).href; } catch { return null; } }
-function clean(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
-function slugFromUrl(u) { try { return new URL(u).pathname.split('/').filter(Boolean).pop() || ''; } catch { return ''; } }
-function idForUrl(u) { return `dex:${slugFromUrl(u)}`; }
-function decodeId(id) { try { return decodeURIComponent(id); } catch { return id; } }
-function seriesSlugFromId(id) { return decodeId(id).replace(/^dex:/, '').trim(); }
-
-async function fetchHtml(url) {
-  const now = Date.now();
-  const hit = cache.get(url);
-  if (hit && now - hit.time < CACHE_MS) return hit.html;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  let r;
-  try {
-    r = await fetch(url, { headers: { 'user-agent': UA, 'accept-language': 'en-US,en;q=0.8' }, redirect: 'follow', signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
-  if (!r.ok) throw new Error(`Upstream ${r.status} for ${url}`);
-  const html = await r.text();
-  cache.set(url, { time: now, html });
-  return html;
-}
+async function catalogIndex() { return discoverCatalogs(false); }
 
 function parseSeriesCards(html) {
   const $ = cheerio.load(html);
-  const seen = new Set(); const out = [];
+  const seen = new Set();
+  const out = [];
   $('a[href]').each((_, el) => {
     const href = abs($(el).attr('href'));
     if (!href || !new URL(href).pathname.includes('/series/')) return;
-    const slug = slugFromUrl(href); if (!slug || seen.has(slug)) return;
-    const card = $(el); const img = card.find('img').first();
-    const title = clean(card.find('h2,h3,h4,[class*="title"]').first().text()) || clean(img.attr('alt')) || clean(card.text()).split('EP ')[0];
+    const slug = slugFromUrl(href);
+    if (!slug || seen.has(slug)) return;
+    const card = $(el);
+    const img = card.find('img').first();
+    const title = clean(card.find('h2,h3,h4,[class*="title"]').first().text()) ||
+      clean(img.attr('alt')) || clean(card.text()).split('EP ')[0];
     if (!title) return;
-    seen.add(slug); out.push({ id: idForUrl(href), type: 'series', name: title, poster: abs(img.attr('src') || img.attr('data-src')) || undefined, href });
+    seen.add(slug);
+    out.push({
+      id: idForUrl(href), type: 'series', name: title,
+      poster: abs(img.attr('src') || img.attr('data-src')), href
+    });
   });
   return out;
 }
 
-function pageUrl(path, page) {
-  return BASE + path + (page === 1 ? '' : `?page=${page}`);
-}
-
+function pageUrl(path, page) { return BASE + path + (page === 1 ? '' : `?page=${page}`); }
 function discoverMaxPage(html) {
   const $ = cheerio.load(html);
   let max = 1;
   $('a[href]').each((_, el) => {
-    const href = $(el).attr('href') || '';
-    const m = href.match(/[?&]page=(\d+)/i);
+    const m = ($(el).attr('href') || '').match(/[?&]page=(\d+)/i);
     if (m) max = Math.max(max, Number(m[1]));
   });
-  const text = clean($.root().text());
-  for (const m of text.matchAll(/(?:^|\s)(\d{2,4})(?:\s|$)/g)) {
-    const n = Number(m[1]);
-    if (n > max && n <= MAX_PAGE) max = n;
-  }
   return Math.min(max, MAX_PAGE);
-}
-
-function parsePage(path, page, html) {
-  return parseSeriesCards(html).map(x => ({ ...x, page }));
 }
 
 async function collectPages(path, targetCount = PAGE_SIZE) {
@@ -138,17 +142,15 @@ async function collectPages(path, targetCount = PAGE_SIZE) {
   const seen = new Set();
   let maxPage = 1;
   for (let page = 1; page <= maxPage && page <= MAX_PAGE; page++) {
-    const url = pageUrl(path, page);
     let html;
-    try { html = await fetchHtml(url); } catch { break; }
+    try { html = await fetchHtml(pageUrl(path, page)); } catch { break; }
     if (page === 1) maxPage = discoverMaxPage(html);
-    const items = parsePage(path, page, html);
+    const items = parseSeriesCards(html);
     let added = 0;
     for (const item of items) {
       if (!seen.has(item.id)) { seen.add(item.id); all.push(item); added++; }
     }
-    if (!items.length || (page > 1 && added === 0)) break;
-    if (all.length >= targetCount) break;
+    if (!items.length || (page > 1 && added === 0) || all.length >= targetCount) break;
   }
   catalogCache.set(cacheKey, { time: now, items: all });
   return all;
@@ -160,7 +162,6 @@ async function refreshCatalogHeads() {
     try { await collectPages(item.path, PAGE_SIZE); } catch {}
   }
 }
-
 setInterval(() => { refreshCatalogHeads().catch(() => {}); }, CATALOG_CACHE_MS).unref();
 
 function episodeNumber(text, href, fallback) {
@@ -174,13 +175,16 @@ function parseMeta(html, url) {
   const description = clean($('meta[name="description"]').attr('content')) || clean($('meta[property="og:description"]').attr('content'));
   const poster = abs($('meta[property="og:image"]').attr('content')) || abs($('img').first().attr('src'));
   const genres = [];
-  $('a[href*="/category/"]').each((_, el) => { const t = clean($(el).text()); if (t && !genres.includes(t)) genres.push(t); });
+  $('a[href*="/category/"]').each((_, el) => {
+    const t = clean($(el).text());
+    if (t && !genres.includes(t)) genres.push(t);
+  });
   const map = new Map();
   $('a[href]').each((_, el) => {
-    const href = abs($(el).attr('href')); const text = clean($(el).text());
+    const href = abs($(el).attr('href'));
+    const text = clean($(el).text());
     if (!href) return;
-    const isEpisode = /\/episode(?:[-_/]|\d)|episode\s*\d+|ep[-_]?\d+/i.test(`${href} ${text}`);
-    if (!isEpisode) return;
+    if (!/\/episode(?:[-_/]|\d)|episode\s*\d+|ep[-_]?\d+/i.test(`${href} ${text}`)) return;
     const n = episodeNumber(text, href, map.size + 1);
     if (!map.has(n)) map.set(n, { href, title: text || `Episode ${n}`, number: n });
   });
@@ -188,141 +192,246 @@ function parseMeta(html, url) {
 }
 
 function decodeEscaped(s) {
-  return s.replace(/\\u0026/g, '&').replace(/\\\//g, '/').replace(/&amp;/g, '&').replace(/\\"/g, '"');
+  return String(s)
+    .replace(/\\u0026/gi, '&')
+    .replace(/\\u003a/gi, ':')
+    .replace(/\\u003d/gi, '=')
+    .replace(/\\u003f/gi, '?')
+    .replace(/\\u002f/gi, '/')
+    .replace(/\\\//g, '/')
+    .replace(/&amp;/g, '&')
+    .replace(/\\"/g, '"');
+}
+
+function isBadUrl(url) {
+  return !url || /\.(jpg|jpeg|png|webp|gif|svg|css|js|woff2?)(?:\?|$)/i.test(url) ||
+    /favicon|logo|sprite|analytics|doubleclick|google-analytics/i.test(url);
+}
+function isPlayableUrl(url) { return /\.(m3u8|mp4)(?:\?|$)/i.test(url || ''); }
+
+function addCandidate(list, value, base, kind = 'unknown') {
+  if (!value || typeof value !== 'string') return;
+  let u = decodeEscaped(value.trim().replace(/["'<>]+$/g, ''));
+  if (!/^https?:\/\//i.test(u)) u = abs(u, base);
+  if (!u || isBadUrl(u) || list.some(x => x.url === u)) return;
+  list.push({ url: u, kind });
+}
+
+function extractAbsoluteUrls(text, base, kind, list) {
+  const raw = decodeEscaped(text);
+  for (const m of raw.matchAll(/https?:\/\/[^"'<>\s\\]+/g)) addCandidate(list, m[0], base, kind);
 }
 
 function mediaCandidates(html, pageUrl) {
   const $ = cheerio.load(html);
-  const candidates = [];
-  const add = (u, kind='media') => {
-    if (!u || typeof u !== 'string') return;
-    u = decodeEscaped(u.trim().replace(/[\"'<>]+$/g, ''));
-    if (!/^https?:\/\//i.test(u)) u = abs(u);
-    if (!u || candidates.some(x => x.url === u)) return;
-    candidates.push({ url: u, kind });
-  };
-
-  $('video source[src], video[src], source[src]').each((_, el) => add($(el).attr('src'), 'media'));
-  $('iframe[src], [data-video], [data-video-url], [data-player], [data-player-url], [data-src*=".m3u8"], [data-src*=".mp4"]').each((_, el) => {
-    add($(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-video') || $(el).attr('data-video-url') || $(el).attr('data-player') || $(el).attr('data-player-url'), 'embed');
-  });
-
-  // Player configs frequently keep the public media URL in inline JS/JSON.
-  const raw = html.replace(/\u0026/g, '&').replace(/\\//g, '/');
-  const urlRe = /https?:\/\/[^"'<>\s\\]+/g;
-  for (const m of raw.matchAll(urlRe)) add(m[0], 'script');
-
-  return candidates;
-}
-
-function scoreCandidate(c) {
-  const u = c.url.toLowerCase();
-  let s = 0;
-  if (/\.m3u8(?:\?|$)/.test(u)) s += 100;
-  if (/\.mp4(?:\?|$)/.test(u)) s += 90;
-  if (/m3u8|mp4/.test(u)) s += 50;
-  if (/dramaboxdb|video|stream|cdn|hls|playlist/.test(u)) s += 10;
-  if (c.kind === 'media') s += 20;
-  if (c.kind === 'script') s += 8;
-  if (c.kind === 'embed') s += 5;
-  if (/\.(jpg|jpeg|png|webp|gif)(?:\?|$)|favicon/.test(u)) s -= 200;
-  if (/dramaexpress\.net\/series\//.test(u)) s -= 50;
-  return s;
-}
-
-async function probeMediaUrl(url) {
-  if (!url || !/^https?:\/\//i.test(url)) return false;
-  if (isObviouslyBadUrl(url)) return false;
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 7000);
-    let r;
-    try {
-      r = await fetch(url, {
-        method: 'HEAD',
-        headers: { 'user-agent': UA, 'accept': '*/*' },
-        redirect: 'follow',
-        signal: controller.signal
-      });
-    } finally { clearTimeout(timer); }
-    const ct = (r.headers.get('content-type') || '').toLowerCase();
-    if (ct.startsWith('video/') || ct.includes('mpegurl') || ct.includes('vnd.apple.mpegurl')) return true;
-    if (r.ok && /\.(m3u8|mp4)(?:\?|$)/i.test(r.url || url)) return true;
-  } catch {}
-  return false;
-}
-
-function isObviouslyBadUrl(url) {
-  return /\.(jpg|jpeg|png|webp|gif|svg|css|js)(?:\?|$)/i.test(url || '') ||
-    /favicon|logo|sprite|analytics|google|facebook|doubleclick/i.test(url || '');
-}
-
-function isPlayableUrl(url) {
-  return /\.(m3u8|mp4)(?:\?|$)/i.test(url || '');
-}
-
-function extractConfigUrls(html, pageUrl) {
   const out = [];
-  const add = (value) => {
-    if (!value || typeof value !== 'string') return;
-    let u = decodeEscaped(value.trim());
-    if (!/^https?:\/\//i.test(u)) u = abs(u);
-    if (!u || isObviouslyBadUrl(u) || out.includes(u)) return;
-    out.push(u);
-  };
-  // Common player JSON keys: file/source/src/url/playback/hls.
-  const re = /(?:"|')?(?:file|source|src|url|playbackUrl|playback_url|hls|stream|videoUrl|video_url)(?:"|')?\s*:\s*(?:"|')([^"']+)(?:"|')/gi;
-  for (const m of html.matchAll(re)) add(m[1]);
-  // Relative/absolute media-like URLs embedded in JSON or JS.
-  const mediaRe = /(?:https?:\/\/[^"'\s<>]+|(?:\/[^"'\s<>]+\.(?:m3u8|mp4)(?:\?[^"'\s<>]*)?))/gi;
-  for (const m of html.matchAll(mediaRe)) add(m[0]);
+  $('video source[src], video[src], source[src]').each((_, el) => addCandidate(out, $(el).attr('src'), pageUrl, 'media'));
+  $('iframe[src], [data-video], [data-video-url], [data-player], [data-player-url], [data-stream], [data-src*=".m3u8"], [data-src*=".mp4"]').each((_, el) => {
+    addCandidate(out,
+      $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-video') ||
+      $(el).attr('data-video-url') || $(el).attr('data-player') || $(el).attr('data-player-url') || $(el).attr('data-stream'),
+      pageUrl, 'embed');
+  });
+  extractAbsoluteUrls(html, pageUrl, 'script', out);
   return out;
 }
 
-async function resolveDramaExpressEpisode(episodeUrl, depth = 0, seen = new Set()) {
-  if (depth > 3 || seen.has(episodeUrl)) return null;
+function extractConfigUrls(text, pageUrl) {
+  const out = [];
+  const keyRe = /(?:["']?(?:file|source|src|url|playbackUrl|playback_url|hls|stream|streamUrl|stream_url|videoUrl|video_url|video|playUrl|play_url|m3u8|mp4|mediaUrl|media_url)["']?)\s*[:=]\s*["']([^"']+)["']/gi;
+  for (const m of text.matchAll(keyRe)) addCandidate(out, m[1], pageUrl, 'config');
+  const mediaRe = /(?:https?:\/\/[^"' \s<>]+|\/(?:[^"' \s<>]+\.(?:m3u8|mp4)(?:\?[^"' \s<>]*)?))/gi;
+  for (const m of text.matchAll(mediaRe)) addCandidate(out, m[0], pageUrl, 'media');
+  return out;
+}
+
+function extractApiUrls(html, pageUrl) {
+  const out = [];
+  const add = value => {
+    if (!value || typeof value !== 'string') return;
+    const u = abs(decodeEscaped(value.trim()), pageUrl);
+    if (!u || isBadUrl(u) || out.includes(u)) return;
+    if (/\/api(?:\/|\?|$)|\/ajax(?:\/|\?|$)|\/graphql(?:\/|\?|$)|\.json(?:\?|$)/i.test(u)) out.push(u);
+  };
+  for (const m of decodeEscaped(html).matchAll(/(?:https?:\/\/[^"'<> \s]+|\/(?:[^"'<> \s]+(?:\/api\/|\/ajax\/|\/graphql\/|\.json(?:\?|$))[^"'<> \s]*))/gi)) add(m[0]);
+  const $ = cheerio.load(html);
+  $('script[src]').each((_, el) => {
+    const src = abs($(el).attr('src'), pageUrl);
+    if (src && /api|ajax|graphql|\.json/i.test(src) && !out.includes(src)) out.push(src);
+  });
+  return out.slice(0, MAX_API_FETCHES);
+}
+
+function extractScriptUrls(html, pageUrl) {
+  const $ = cheerio.load(html);
+  const out = [];
+  $('script[src]').each((_, el) => {
+    const u = abs($(el).attr('src'), pageUrl);
+    if (u && !isBadUrl(u) && !out.includes(u)) out.push(u);
+  });
+  return out.slice(0, MAX_SCRIPT_FETCHES);
+}
+
+function urlsFromObject(value, base, out = [], depth = 0) {
+  if (depth > 7 || out.length >= 80) return out;
+  if (typeof value === 'string') {
+    const decoded = decodeEscaped(value);
+    if (/^https?:\/\//i.test(decoded) || /^\//.test(decoded)) {
+      const u = abs(decoded, base);
+      if (u && !isBadUrl(u) && /m3u8|mp4|stream|video|playback|media|source|file|url/i.test(decoded)) out.push(u);
+    }
+    return out;
+  }
+  if (Array.isArray(value)) {
+    for (const v of value) urlsFromObject(v, base, out, depth + 1);
+    return out;
+  }
+  if (value && typeof value === 'object') {
+    for (const [key, v] of Object.entries(value)) {
+      if (/url|src|file|video|stream|play|hls|media|source/i.test(key)) urlsFromObject(v, base, out, depth + 1);
+      else if (depth < 3) urlsFromObject(v, base, out, depth + 1);
+    }
+  }
+  return out;
+}
+
+async function probeMediaUrl(url, referer) {
+  if (!/^https?:\/\//i.test(url || '') || isBadUrl(url)) return false;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+  try {
+    const r = await fetch(url, {
+      method: 'HEAD',
+      headers: { 'user-agent': UA, accept: '*/*', ...(referer ? { referer } : {}) },
+      redirect: 'follow', signal: controller.signal
+    });
+    const ct = (r.headers.get('content-type') || '').toLowerCase();
+    return ct.startsWith('video/') || ct.includes('mpegurl') || ct.includes('vnd.apple.mpegurl') ||
+      (r.ok && isPlayableUrl(r.url || url));
+  } catch {
+    return false;
+  } finally { clearTimeout(timer); }
+}
+
+function rank(c) {
+  const u = c.url.toLowerCase();
+  let s = 0;
+  if (/\.m3u8(?:\?|$)/.test(u)) s += 120;
+  if (/\.mp4(?:\?|$)/.test(u)) s += 110;
+  if (/m3u8|mp4/.test(u)) s += 60;
+  if (/stream|video|hls|playlist|playback|media|cdn/.test(u)) s += 25;
+  if (c.kind === 'media') s += 30;
+  if (c.kind === 'config') s += 20;
+  if (c.kind === 'script') s += 10;
+  if (c.kind === 'embed') s += 5;
+  return s;
+}
+
+async function inspectPage(url, referer) {
+  const html = await fetchText(url, { referer: referer || BASE }, false);
+  return {
+    html,
+    candidates: [...mediaCandidates(html, url), ...extractConfigUrls(html, url)].sort((a,b) => rank(b) - rank(a)),
+    apiUrls: extractApiUrls(html, url),
+    scriptUrls: extractScriptUrls(html, url)
+  };
+}
+
+async function resolveDramaExpressEpisode(episodeUrl, depth = 0, seen = new Set(), debug = null) {
+  if (depth > 4 || seen.has(episodeUrl)) return null;
   seen.add(episodeUrl);
-  const html = await fetchHtml(episodeUrl);
-  const configUrls = extractConfigUrls(html, episodeUrl).map(url => ({ url, kind:'script' }));
-  const candidates = [...mediaCandidates(html, episodeUrl), ...configUrls]
-    .filter(c => !isObviouslyBadUrl(c.url))
-    .sort((a,b) => scoreCandidate(b) - scoreCandidate(a));
+  if (debug) debug.visited.push(episodeUrl);
 
-  // First accept explicit media extensions.
-  for (const c of candidates) {
-    if (isPlayableUrl(c.url)) return c.url;
+  let info;
+  try { info = await inspectPage(episodeUrl, depth ? [...seen][Math.max(0, seen.size - 2)] : BASE); }
+  catch (e) { if (debug) debug.errors.push(`${episodeUrl}: ${e.message}`); return null; }
+
+  if (debug) {
+    debug.candidates.push(...info.candidates.slice(0, 40).map(x => ({ ...x, source: episodeUrl })));
+    debug.apiUrls.push(...info.apiUrls);
+    debug.scriptUrls.push(...info.scriptUrls);
   }
 
-  // Some public players expose a video URL without a .mp4/.m3u8 suffix.
-  // Verify the Content-Type before returning it to Nuvio.
-  for (const c of candidates.filter(x => x.kind !== 'embed').slice(0, 20)) {
-    if (await probeMediaUrl(c.url)) return c.url;
-  }
+  for (const c of info.candidates) if (isPlayableUrl(c.url)) return c.url;
+  for (const c of info.candidates.slice(0, 25)) if (await probeMediaUrl(c.url, episodeUrl)) return c.url;
 
-  // Follow likely player/embed pages. Their HTML may contain a second-level player config.
-  const embeds = candidates.filter(c => c.kind === 'embed').slice(0, 8);
-  for (const c of embeds) {
+  for (const api of info.apiUrls.slice(0, MAX_API_FETCHES)) {
     try {
-      const nested = await resolveDramaExpressEpisode(c.url, depth + 1, seen);
+      const body = await fetchText(api, { referer: episodeUrl, accept: 'application/json,text/plain,*/*' }, false);
+      if (debug) debug.apiResponses.push({ url: api, preview: body.slice(0, 1200) });
+      let json;
+      try { json = JSON.parse(body); } catch { json = null; }
+      const fromJson = json ? urlsFromObject(json, api) : [];
+      const fromText = [...extractConfigUrls(body, api), ...mediaCandidates(body, api)];
+      const apiCandidates = [...new Set([...fromJson, ...fromText.map(x => x.url)])];
+      for (const u of apiCandidates) {
+        if (isPlayableUrl(u)) return u;
+        if (await probeMediaUrl(u, api)) return u;
+      }
+    } catch (e) {
+      if (debug) debug.errors.push(`${api}: ${e.message}`);
+    }
+  }
+
+  for (const script of info.scriptUrls.slice(0, MAX_SCRIPT_FETCHES)) {
+    try {
+      const js = await fetchText(script, { referer: episodeUrl }, false);
+      const candidates = [...extractConfigUrls(js, script), ...mediaCandidates(js, script)].sort((a,b) => rank(b) - rank(a));
+      if (debug) debug.scriptResponses.push({ url: script, candidates: candidates.slice(0, 30).map(x => x.url) });
+      for (const c of candidates) {
+        if (isPlayableUrl(c.url)) return c.url;
+        if (await probeMediaUrl(c.url, script)) return c.url;
+      }
+    } catch (e) {
+      if (debug) debug.errors.push(`${script}: ${e.message}`);
+    }
+  }
+
+  for (const c of info.candidates.filter(x => x.kind === 'embed').slice(0, 8)) {
+    try {
+      const nested = await resolveDramaExpressEpisode(c.url, depth + 1, seen, debug);
       if (nested) return nested;
     } catch {}
   }
   return null;
 }
 
+async function buildMeta(id) {
+  const slug = seriesSlugFromId(id);
+  const url = `${BASE}/series/${slug}`;
+  const m = parseMeta(await fetchHtml(url), url);
+  const videos = m.episodes.map(ep => ({
+    id: `${id}:ep:${ep.number}`,
+    title: ep.title || `Episode ${ep.number}`,
+    season: 1,
+    episode: ep.number,
+    thumbnail: m.poster
+  }));
+  return { id, type: 'series', name: m.title, poster: m.poster, posterShape: 'poster', description: m.description, genres: m.genres, videos };
+}
+
 async function manifest() {
   const index = await catalogIndex();
   return {
-    id: 'com.nv.drmshort.addon', version: '1.8.0', name: 'NV Drama Short',
-    description: 'Nuvio addon that dynamically mirrors DramaExpress categories and source catalogs and resolves publicly exposed episode streams from DramaExpress pages.',
-    logo: 'https://dramaexpress.net/favicon.ico', resources: ['catalog','meta','stream'], types: ['series'], idPrefixes: ['dex:'],
-    catalogs: Object.values(index).map(x => ({ type:'series', id:x.id, name:x.name, extra:[{ name:'search', isRequired:false }, { name:'skip', isRequired:false }] })),
-    behaviorHints: { configurable:false, p2pNotSupported:true }
+    id: 'com.nv.drmshort.addon',
+    version: VERSION,
+    name: 'NV Drama Short',
+    description: 'Nuvio addon that dynamically mirrors DramaExpress catalogs and resolves publicly exposed episode streams.',
+    logo: `${BASE}/favicon.ico`,
+    resources: ['catalog', 'meta', 'stream'],
+    types: ['series'],
+    idPrefixes: ['dex:'],
+    catalogs: Object.values(index).map(x => ({
+      type: 'series', id: x.id, name: x.name,
+      extra: [{ name: 'search', isRequired: false }, { name: 'skip', isRequired: false }]
+    })),
+    behaviorHints: { configurable: false, p2pNotSupported: true }
   };
 }
 
 app.get('/manifest.json', async (_, res) => {
-  try { res.json(await manifest()); } catch (e) { res.status(502).json({ error:e.message }); }
+  try { res.json(await manifest()); }
+  catch (e) { res.status(502).json({ error: e.message }); }
 });
 
 app.get('/catalog/series/:id.json', async (req, res) => {
@@ -331,8 +440,8 @@ app.get('/catalog/series/:id.json', async (req, res) => {
     const item = index[req.params.id];
     if (!item) return res.json({ metas: [] });
     const items = await collectPages(item.path, PAGE_SIZE);
-    res.json({ metas: items.slice(0, PAGE_SIZE).map(x => ({ id:x.id,type:'series',name:x.name,poster:x.poster })) });
-  } catch (e) { res.status(502).json({ metas:[], error:e.message }); }
+    res.json({ metas: items.slice(0, PAGE_SIZE).map(x => ({ id: x.id, type: 'series', name: x.name, poster: x.poster })) });
+  } catch (e) { res.status(502).json({ metas: [], error: e.message }); }
 });
 
 app.get('/catalog/series/:id/:extra.json', async (req, res) => {
@@ -345,57 +454,64 @@ app.get('/catalog/series/:id/:extra.json', async (req, res) => {
     const skip = Math.max(0, Number(params.get('skip') || 0));
     const items = await collectPages(item.path, skip + PAGE_SIZE);
     const filtered = q ? items.filter(x => x.name.toLowerCase().includes(q.toLowerCase())) : items;
-    res.json({ metas: filtered.slice(skip, skip + PAGE_SIZE).map(x => ({ id:x.id,type:'series',name:x.name,poster:x.poster })) });
-  } catch (e) { res.status(502).json({ metas:[], error:e.message }); }
+    res.json({ metas: filtered.slice(skip, skip + PAGE_SIZE).map(x => ({ id: x.id, type: 'series', name: x.name, poster: x.poster })) });
+  } catch (e) { res.status(502).json({ metas: [], error: e.message }); }
 });
 
 app.get('/meta/series/:id.json', async (req, res) => {
-  try {
-    const slug = seriesSlugFromId(req.params.id); const url = `${BASE}/series/${slug}`; const m = parseMeta(await fetchHtml(url), url);
-    const videos = m.episodes.map(ep => ({ id:`${req.params.id}:ep:${ep.number}`, title:ep.title || `Episode ${ep.number}`, season:1, episode:ep.number, thumbnail:m.poster, released: undefined }));
-    res.json({ meta:{ id:req.params.id,type:'series',name:m.title,poster:m.poster,posterShape:'poster',description:m.description,genres:m.genres,videos } });
-  } catch (e) { res.status(502).json({ meta:{id:req.params.id,type:'series',name:req.params.id}, error:e.message }); }
-});
-
-app.get('/stream/series/:id.json', async (req, res) => {
-  try {
-    const decodedId = decodeId(req.params.id); const [seriesId, epPart] = decodedId.split(':ep:'); const slug = seriesSlugFromId(seriesId);
-    const pageUrl = `${BASE}/series/${slug}`; const m = parseMeta(await fetchHtml(pageUrl), pageUrl); const n = Number(epPart || 1);
-    const ep = m.episodes.find(x => x.number === n) || m.episodes[n - 1]; if (!ep) return res.json({ streams:[] });
-    const target = await resolveDramaExpressEpisode(ep.href);
-    if (!target) return res.json({ streams:[] });
-    const stream = { title:ep.title || `Episode ${n}`, url:target, behaviorHints:{ bingeGroup:'dramaexpress', videoOrientation:'portrait' } };
-    if (/\.m3u8(?:\?|$)/i.test(target)) stream.behaviorHints.videoSize = 0;
-    res.json({ streams:[stream] });
-  } catch (e) { res.status(502).json({ streams:[], error:e.message }); }
+  try { res.json({ meta: await buildMeta(decodeId(req.params.id)) }); }
+  catch (e) { res.status(502).json({ meta: { id: req.params.id, type: 'series', name: req.params.id }, error: e.message }); }
 });
 
 app.get('/meta/series/:id', async (req, res, next) => {
   if (req.params.id.endsWith('.json')) return next();
-  try {
-    const id = decodeId(req.params.id);
-    const slug = seriesSlugFromId(id);
-    const url = `${BASE}/series/${slug}`;
-    const m = parseMeta(await fetchHtml(url), url);
-    const videos = m.episodes.map(ep => ({ id:`${id}:ep:${ep.number}`, title:ep.title || `Episode ${ep.number}`, season:1, episode:ep.number, thumbnail:m.poster }));
-    res.json({ meta:{ id,type:'series',name:m.title,poster:m.poster,posterShape:'poster',description:m.description,genres:m.genres,videos } });
-  } catch (e) { res.status(502).json({ meta:{id:req.params.id,type:'series',name:req.params.id}, error:e.message }); }
+  try { res.json({ meta: await buildMeta(decodeId(req.params.id)) }); }
+  catch (e) { res.status(502).json({ meta: { id: req.params.id, type: 'series', name: req.params.id }, error: e.message }); }
 });
 
+app.get('/stream/series/:id.json', async (req, res) => {
+  try {
+    const decodedId = decodeId(req.params.id);
+    const [seriesId, epPart] = decodedId.split(':ep:');
+    const slug = seriesSlugFromId(seriesId);
+    const pageUrl = `${BASE}/series/${slug}`;
+    const m = parseMeta(await fetchHtml(pageUrl), pageUrl);
+    const n = Number(epPart || 1);
+    const ep = m.episodes.find(x => x.number === n) || m.episodes[n - 1];
+    if (!ep) return res.json({ streams: [] });
+
+    const target = await resolveDramaExpressEpisode(ep.href);
+    if (!target) return res.json({ streams: [] });
+
+    res.json({ streams: [{
+      title: ep.title || `Episode ${n}`,
+      url: target,
+      behaviorHints: { bingeGroup: 'dramaexpress', videoOrientation: 'portrait' }
+    }] });
+  } catch (e) { res.status(502).json({ streams: [], error: e.message }); }
+});
 
 app.get('/stream-debug/series/:id.json', async (req, res) => {
   try {
-    const decodedId = decodeId(req.params.id); const [seriesId, epPart] = decodedId.split(':ep:'); const slug = seriesSlugFromId(seriesId);
-    const pageUrl = `${BASE}/series/${slug}`; const m = parseMeta(await fetchHtml(pageUrl), pageUrl); const n = Number(epPart || 1);
+    const decodedId = decodeId(req.params.id);
+    const [seriesId, epPart] = decodedId.split(':ep:');
+    const slug = seriesSlugFromId(seriesId);
+    const pageUrl = `${BASE}/series/${slug}`;
+    const m = parseMeta(await fetchHtml(pageUrl), pageUrl);
+    const n = Number(epPart || 1);
     const ep = m.episodes.find(x => x.number === n) || m.episodes[n - 1];
-    if (!ep) return res.json({ ok:false, stage:'episode', message:'Episode not found' });
-    const html = await fetchHtml(ep.href);
-    const candidates = mediaCandidates(html, ep.href).map(x => ({...x, playable:isPlayableUrl(x.url)}));
-    const configUrls = extractConfigUrls(html, ep.href).map(url => ({url,kind:'script',playable:isPlayableUrl(url)}));
-    res.json({ ok:true, episode:ep.href, candidates:[...candidates,...configUrls].slice(0,50) });
-  } catch (e) { res.status(502).json({ ok:false, error:e.message }); }
+    if (!ep) return res.json({ ok: false, stage: 'episode', message: 'Episode not found' });
+
+    const debug = {
+      ok: true, version: VERSION, episode: ep.href, visited: [], candidates: [],
+      apiUrls: [], apiResponses: [], scriptUrls: [], scriptResponses: [], errors: []
+    };
+    debug.stream = await resolveDramaExpressEpisode(ep.href, 0, new Set(), debug);
+    debug.resolved = Boolean(debug.stream);
+    res.json(debug);
+  } catch (e) { res.status(502).json({ ok: false, version: VERSION, error: e.message }); }
 });
 
-app.get('/health', (_, res) => res.json({ ok:true, version:'1.8.0', port:PORT }));
-app.get('/', (_, res) => res.type('text').send('Nuvio DramaExpress addon is running. Use /manifest.json'));
-app.listen(PORT, '0.0.0.0', () => console.log(`DramaExpress addon listening on 0.0.0.0:${PORT}`));
+app.get('/health', (_, res) => res.json({ ok: true, version: VERSION, port: PORT }));
+app.get('/', (_, res) => res.type('text').send(`Nuvio DramaExpress addon ${VERSION} is running. Use /manifest.json`));
+app.listen(PORT, '0.0.0.0', () => console.log(`DramaExpress addon ${VERSION} listening on 0.0.0.0:${PORT}`));
