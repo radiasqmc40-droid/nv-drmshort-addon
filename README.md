@@ -1,21 +1,10 @@
-# NV Drama Short 1.8.2
+# NV Drama Short 1.8.3
 
-Nuvio addon for DramaExpress.
+Dynamic Nuvio addon for DramaExpress.
 
-## Run
-```bash
-npm install
-npm start
-```
+1. Upload/overwrite `package.json`, `src/server.js`, and `README.md`.
+2. Deploy with Node 20+ and `npm start`.
+3. Verify `/health` reports `1.8.3`.
+4. Use `/stream-debug/series/upgrade.json` to inspect player/API discovery before testing in Nuvio.
 
-Requires Node.js 20+.
-
-## Endpoints
-- `/manifest.json`
-- `/health`
-- `/catalog/...`
-- `/meta/...`
-- `/stream/...`
-- `/stream-debug/...`
-
-Version is explicitly `1.8.2` in `package.json`, `server.js`, manifest, health response, and startup log.
+1.8.3 improves runtime player/API discovery, embedded JSON parsing, iframe/data attribute discovery, URL cleanup, and debug output for player links/responses.

@@ -2,7 +2,7 @@ import express from 'express';
 import * as cheerio from 'cheerio';
 
 const app = express();
-const VERSION = '1.8.2';
+const VERSION = '1.8.3';
 const PORT = Number(process.env.PORT) || 3000;
 const BASE = 'https://dramaexpress.net';
 const UA = `Mozilla/5.0 (compatible; Nuvio-DramaExpress-Addon/${VERSION})`;
@@ -14,7 +14,9 @@ const PROBE_TIMEOUT_MS = 7000;
 const MAX_PAGE = 1000;
 const PAGE_SIZE = 100;
 const MAX_SCRIPT_FETCHES = 8;
-const MAX_API_FETCHES = 20;
+const MAX_API_FETCHES = 30;
+const MAX_INLINE_SCAN = 20;
+const MAX_DISCOVERED_FETCHES = 30;
 const MAX_PROXY_BYTES = 25 * 1024 * 1024;
 
 const htmlCache = new Map();
@@ -210,10 +212,19 @@ function isBadUrl(url) {
 }
 function isPlayableUrl(url) { return /\.(m3u8|mp4)(?:\?|$)/i.test(url || ''); }
 
+function normalizeUrlValue(value) {
+  return decodeEscaped(String(value || ''))
+    .trim()
+    .replace(/^[\"'`<>()]+/, '')
+    .replace(/[\"'`<>(),;]+$/g, '')
+    .replace(/\\+$/g, '');
+}
+
 function addCandidate(list, value, base, kind = 'unknown') {
   if (!value || typeof value !== 'string') return;
-  let u = decodeEscaped(value.trim().replace(/["'<>]+$/g, ''));
-  if (!/^https?:\/\//i.test(u)) u = abs(u, base);
+  const cleaned = normalizeUrlValue(value);
+  if (!cleaned) return;
+  let u = /^https?:\/\//i.test(cleaned) ? cleaned : abs(cleaned, base);
   if (!u || isBadUrl(u) || list.some(x => x.url === u)) return;
   list.push({ url: u, kind });
 }
@@ -226,13 +237,15 @@ function extractAbsoluteUrls(text, base, kind, list) {
 function mediaCandidates(html, pageUrl) {
   const $ = cheerio.load(html);
   const out = [];
-  $('video source[src], video[src], source[src]').each((_, el) => addCandidate(out, $(el).attr('src'), pageUrl, 'media'));
-  $('iframe[src], [data-video], [data-video-url], [data-player], [data-player-url], [data-stream], [data-src*=".m3u8"], [data-src*=".mp4"]').each((_, el) => {
+  $('video source[src], video[src], source[src], track[src]').each((_, el) => addCandidate(out, $(el).attr('src'), pageUrl, 'media'));
+  $('iframe[src], frame[src], embed[src], object[data], [data-video], [data-video-url], [data-player], [data-player-url], [data-stream], [data-src*=".m3u8"], [data-src*=".mp4"]').each((_, el) => {
     addCandidate(out,
-      $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-video') ||
+      $(el).attr('src') || $(el).attr('data') || $(el).attr('data-src') || $(el).attr('data-video') ||
       $(el).attr('data-video-url') || $(el).attr('data-player') || $(el).attr('data-player-url') || $(el).attr('data-stream'),
       pageUrl, 'embed');
   });
+  for (const c of extractEmbeddedJson(html, pageUrl)) addCandidate(out, c.url, pageUrl, c.kind);
+  for (const c of extractRuntimeUrls(html, pageUrl)) addCandidate(out, c.url, pageUrl, c.kind);
   extractAbsoluteUrls(html, pageUrl, 'script', out);
   return out;
 }
@@ -244,6 +257,65 @@ function extractConfigUrls(text, pageUrl) {
   const mediaRe = /(?:https?:\/\/[^"' \s<>]+|\/(?:[^"' \s<>]+\.(?:m3u8|mp4)(?:\?[^"' \s<>]*)?))/gi;
   for (const m of text.matchAll(mediaRe)) addCandidate(out, m[0], pageUrl, 'media');
   return out;
+}
+
+function extractRuntimeUrls(text, pageUrl) {
+  const out = [];
+  const raw = decodeEscaped(text);
+  const add = (value, kind = 'runtime') => addCandidate(out, value, pageUrl, kind);
+
+  // URLs passed to fetch/axios/XHR and common player APIs.
+  const callRe = /(?:fetch|axios\.(?:get|post|request)|open)\s*\(\s*[`"']([^`"']+)[`"']/gi;
+  for (const m of raw.matchAll(callRe)) add(m[1], 'api');
+
+  // Relative/absolute endpoint strings containing video/player/episode semantics.
+  const endpointRe = /(?:https?:\/\/[^\s"'`<>]+|\/(?:api|ajax|graphql|player|play|video|stream|episode|episodes|media|source|v1|v2)[^\s"'`<>]*)/gi;
+  for (const m of raw.matchAll(endpointRe)) add(m[0], 'api');
+
+  // NetShort-style playback fields and signed playback URLs.
+  const fieldRe = /(?:playUrl|backupPlayUrl|play_url|playbackUrl|playback_url|videoUrl|video_url|streamUrl|stream_url|m3u8Url|m3u8_url|mediaUrl|media_url|episodeUrl|episode_url|playerUrl|player_url)\s*[:=]\s*["'`]([^"'`]+)["'`]/gi;
+  for (const m of raw.matchAll(fieldRe)) add(m[1], 'config');
+
+  // JSON-like strings that contain a direct CDN URL even when the key is minified.
+  const directMediaRe = /https?:\/\/[^\s"'`<>\\]+(?:\.m3u8(?:\?[^\s"'`<>\\]*)?|\.mp4(?:\?[^\s"'`<>\\]*)?)/gi;
+  for (const m of raw.matchAll(directMediaRe)) add(m[0], 'media');
+
+  return out;
+}
+
+function extractEmbeddedJson(html, pageUrl) {
+  const out = [];
+  const $ = cheerio.load(html);
+  $('script[type="application/json"], script[type="application/ld+json"], script#__NEXT_DATA__, script[id*="__NEXT_DATA__"], script[id*="data"]')
+    .slice(0, MAX_INLINE_SCAN)
+    .each((_, el) => {
+      const txt = $(el).text();
+      if (!txt) return;
+      try {
+        const json = JSON.parse(txt);
+        urlsFromObject(json, pageUrl, out);
+      } catch {}
+      for (const c of extractRuntimeUrls(txt, pageUrl)) out.push(c.url);
+      for (const c of extractConfigUrls(txt, pageUrl)) out.push(c.url);
+    });
+  return [...new Set(out)].map(url => ({ url, kind: /m3u8|mp4/i.test(url) ? 'media' : 'embedded' }));
+}
+
+function extractPlayerLinks(html, pageUrl) {
+  const $ = cheerio.load(html);
+  const out = [];
+  $('iframe[src], frame[src], embed[src], object[data], video[src], source[src], link[href], [data-src], [data-url], [data-href], [data-endpoint], [data-api], [data-play], [data-video], [data-stream], [data-player]')
+    .each((_, el) => {
+      const value = $(el).attr('src') || $(el).attr('data') || $(el).attr('href') ||
+        $(el).attr('data-src') || $(el).attr('data-url') || $(el).attr('data-href') ||
+        $(el).attr('data-endpoint') || $(el).attr('data-api') || $(el).attr('data-play') ||
+        $(el).attr('data-video') || $(el).attr('data-stream') || $(el).attr('data-player');
+      if (!value) return;
+      const u = abs(normalizeUrlValue(value), pageUrl);
+      if (!u || isBadUrl(u) || out.some(x => x === u)) return;
+      if (/iframe|frame|embed|video|source/i.test(el.tagName || '') || /player|play|video|stream|episode|api|ajax|media/i.test(u)) out.push(u);
+    });
+  return out.slice(0, MAX_DISCOVERED_FETCHES);
 }
 
 function extractApiUrls(html, pageUrl) {
@@ -336,11 +408,15 @@ function rank(c) {
 
 async function inspectPage(url, referer) {
   const html = await fetchText(url, { referer: referer || BASE }, false);
+  const candidates = [...mediaCandidates(html, url), ...extractConfigUrls(html, url)];
+  const discovered = extractPlayerLinks(html, url);
+  const runtime = extractRuntimeUrls(html, url);
   return {
     html,
-    candidates: [...mediaCandidates(html, url), ...extractConfigUrls(html, url)].sort((a,b) => rank(b) - rank(a)),
-    apiUrls: extractApiUrls(html, url),
-    scriptUrls: extractScriptUrls(html, url)
+    candidates: candidates.sort((a,b) => rank(b) - rank(a)),
+    apiUrls: [...new Set([...extractApiUrls(html, url), ...discovered.filter(u => /api|ajax|graphql|play|video|stream|episode|media/i.test(u)), ...runtime.filter(x => x.kind === 'api').map(x => x.url)])].slice(0, MAX_DISCOVERED_FETCHES),
+    scriptUrls: extractScriptUrls(html, url),
+    playerLinks: discovered
   };
 }
 
@@ -357,6 +433,7 @@ async function resolveDramaExpressEpisode(episodeUrl, depth = 0, seen = new Set(
     debug.candidates.push(...info.candidates.slice(0, 40).map(x => ({ ...x, source: episodeUrl })));
     debug.apiUrls.push(...info.apiUrls);
     debug.scriptUrls.push(...info.scriptUrls);
+    debug.playerLinks.push(...(info.playerLinks || []));
   }
 
   for (const c of info.candidates.slice(0, 30)) {
@@ -390,6 +467,28 @@ async function resolveDramaExpressEpisode(episodeUrl, depth = 0, seen = new Set(
       }
     } catch (e) {
       if (debug) debug.errors.push(`${script}: ${e.message}`);
+    }
+  }
+
+  for (const player of (info.playerLinks || []).slice(0, MAX_DISCOVERED_FETCHES)) {
+    if (seen.has(player)) continue;
+    try {
+      const body = await fetchText(player, { referer: episodeUrl }, false);
+      const playerCandidates = [
+        ...extractConfigUrls(body, player),
+        ...mediaCandidates(body, player),
+        ...extractEmbeddedJson(body, player),
+        ...extractRuntimeUrls(body, player)
+      ];
+      if (debug) debug.playerResponses.push({ url: player, candidates: playerCandidates.slice(0, 40).map(x => x.url || x) });
+      for (const c of playerCandidates) {
+        const u = typeof c === 'string' ? c : c.url;
+        if (u && await probeMediaUrl(u, player)) return { url: u, referer: player };
+      }
+      const nested = await resolveDramaExpressEpisode(player, depth + 1, seen, debug);
+      if (nested) return nested;
+    } catch (e) {
+      if (debug) debug.errors.push(`${player}: ${e.message}`);
     }
   }
 
@@ -596,7 +695,7 @@ app.get('/stream-debug/series/:id.json', async (req, res) => {
 
     const debug = {
       ok: true, version: VERSION, episode: ep.href, visited: [], candidates: [],
-      apiUrls: [], apiResponses: [], scriptUrls: [], scriptResponses: [], errors: []
+      apiUrls: [], apiResponses: [], scriptUrls: [], scriptResponses: [], playerLinks: [], playerResponses: [], errors: []
     };
     const resolved = await resolveDramaExpressEpisode(ep.href, 0, new Set(), debug);
     debug.stream = resolved?.url || null;
