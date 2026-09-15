@@ -1,8 +1,8 @@
 {
   "id": "com.nv.drmshort.addon",
-  "version": "1.6.0",
+  "version": "1.8.0",
   "name": "NV Drama Short",
-  "description": "Nuvio addon that dynamically discovers DramaExpress categories and source catalogs.",
+  "description": "Nuvio addon that dynamically discovers DramaExpress catalogs and resolves publicly exposed episode streams.",
   "logo": "https://dramaexpress.net/favicon.ico",
   "resources": [
     "catalog",
