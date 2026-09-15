@@ -1,12 +1,23 @@
 {
   "id": "com.nv.drmshort.addon",
-  "version": "1.2.0",
+  "version": "1.6.0",
   "name": "NV Drama Short",
-  "description": "Nuvio addon that indexes DramaExpress categories and source catalogs and resolves publicly exposed episode streams from DramaExpress pages.",
+  "description": "Nuvio addon that dynamically discovers DramaExpress categories and source catalogs.",
   "logo": "https://dramaexpress.net/favicon.ico",
-  "resources": ["catalog", "meta", "stream"],
-  "types": ["series"],
-  "idPrefixes": ["dex:"],
+  "resources": [
+    "catalog",
+    "meta",
+    "stream"
+  ],
+  "types": [
+    "series"
+  ],
+  "idPrefixes": [
+    "dex:"
+  ],
   "catalogs": [],
-  "behaviorHints": {"configurable": false, "p2pNotSupported": true}
+  "behaviorHints": {
+    "configurable": false,
+    "p2pNotSupported": true
+  }
 }

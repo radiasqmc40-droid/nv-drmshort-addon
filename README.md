@@ -14,3 +14,7 @@ The addon does not host video and does not bypass DRM, authentication, paid acce
 The addon does not store a fixed movie list. It reads DramaExpress catalog pages at runtime, follows pagination (up to 500 pages per catalog), deduplicates titles, and exposes results to Nuvio in pages of 100 items. Catalog heads are refreshed automatically about every 30 minutes, while individual HTML pages are cached briefly to reduce upstream load. New titles added to DramaExpress therefore become available automatically without rebuilding the ZIP.
 
 The addon includes the 17 requested source catalogs plus the current DramaExpress genre catalogs. It does not guarantee that a title remains available upstream, and it does not bypass DRM, authentication, or paid access controls.
+
+
+### Dynamic collection discovery
+The addon discovers current `/category/*` and `/source/*` collections from DramaExpress `/categories`, `/sources`, and the homepage instead of hard-coding the collection list. Discovery is cached for 30 minutes, so newly added categories or sources can appear without rebuilding the addon.

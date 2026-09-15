@@ -7,50 +7,68 @@ const BASE = 'https://dramaexpress.net';
 const UA = 'Mozilla/5.0 (compatible; Nuvio-DramaExpress-Addon/1.2)';
 const CACHE_MS = 10 * 60 * 1000;
 const CATALOG_CACHE_MS = 30 * 60 * 1000;
-const MAX_PAGE = 500;
+const DISCOVERY_CACHE_MS = 30 * 60 * 1000;
+const MAX_PAGE = 1000;
 const PAGE_SIZE = 100;
 const catalogCache = new Map();
 const cache = new Map();
+let discoveredCatalogs = null;
+let discoveredAt = 0;
 
-const catalogs = {
-  popular: '/category/popular',
-  'revenge-payback': '/category/revenge-payback',
-  'rise-comeback': '/category/rise-comeback',
-  'hidden-identity': '/category/hidden-identity',
-  'second-chance-rebirth': '/category/second-chance-rebirth',
-  'romance-sweet-love': '/category/romance-sweet-love',
-  'enemies-to-lovers': '/category/enemies-to-lovers',
-  'marriage-love': '/category/marriage-love',
-  'ceo-billionaire': '/category/ceo-billionaire',
-  'rich-family-elite': '/category/rich-family-elite',
-  'strong-women': '/category/strong-women',
-  'family-drama': '/category/family-drama',
-  'modern-drama': '/category/modern-drama',
-  'historical-period': '/category/historical-period',
-  'fantasy-supernatural': '/category/fantasy-supernatural',
-  'powerful-hero': '/category/powerful-hero',
-  'adored-pampered': '/category/adored-pampered',
-  anime: '/category/anime',
-  'new-releases': '/category/new-releases'
-};
+function slugifyId(s) {
+  return clean(s).toLowerCase().replace(/&/g, 'and').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
 
-const sources = {
-  dramabox: 'DramaBox', flareflow: 'FlareFlow', flickreels: 'FlickReels',
-  goodshort: 'GoodShort', joyreels: 'JoyReels', kalostv: 'KalosTV',
-  moboreels: 'MoboReels', moreshort: 'MoreShort', mydramawave: 'MyDramaWave',
-  netshort: 'NetShort', petadrama: 'PetaDrama', reelshort: 'Reelshort',
-  shortical: 'Shortical', shorttv: 'ShortTV', shortwave: 'ShortWave',
-  stardust: 'Stardust', storyreel: 'StoryReel'
-};
+function labelFromSlug(slug) {
+  return clean(slug.replace(/[-_]+/g, ' ')).replace(/\b\w/g, c => c.toUpperCase());
+}
 
-const catalogsAll = { ...catalogs, ...Object.fromEntries(Object.keys(sources).map(k => [`source-${k}`, `/source/${k}`])) };
-const catalogNames = Object.fromEntries(Object.entries(catalogs).map(([id]) => [id, id === 'new-releases' ? 'New Releases' : id.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase())]));
-for (const [id, name] of Object.entries(sources)) catalogNames[`source-${id}`] = name;
+async function discoverCatalogs(force = false) {
+  const now = Date.now();
+  if (!force && discoveredCatalogs && now - discoveredAt < DISCOVERY_CACHE_MS) return discoveredCatalogs;
+
+  const found = new Map();
+  const add = (type, href, label) => {
+    try {
+      const u = new URL(href, BASE);
+      const parts = u.pathname.split('/').filter(Boolean);
+      const index = parts[0] === 'category' || parts[0] === 'source' ? 0 : -1;
+      if (index < 0 || !parts[1]) return;
+      const slug = parts[1].toLowerCase();
+      const id = type === 'category' ? slug : `source-${slug}`;
+      if (!found.has(id)) found.set(id, { id, type, path: `/${parts[0]}/${slug}`, name: clean(label) || labelFromSlug(slug) });
+    } catch {}
+  };
+
+  for (const path of ['/categories', '/sources', '/']) {
+    try {
+      const html = await fetchHtml(BASE + path);
+      const $ = cheerio.load(html);
+      $('a[href]').each((_, el) => {
+        const href = $(el).attr('href') || '';
+        const text = clean($(el).text());
+        if (/\/category\//i.test(href)) add('category', href, text);
+        else if (/\/source\//i.test(href)) add('source', href, text);
+      });
+    } catch {}
+  }
+
+  if (!found.size) throw new Error('Could not discover DramaExpress categories/sources');
+  discoveredCatalogs = Object.fromEntries([...found.values()].map(x => [x.id, x]));
+  discoveredAt = now;
+  return discoveredCatalogs;
+}
+
+async function catalogIndex() {
+  return discoverCatalogs(false);
+}
 
 function abs(u) { try { return new URL(u, BASE).href; } catch { return null; } }
 function clean(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
 function slugFromUrl(u) { try { return new URL(u).pathname.split('/').filter(Boolean).pop() || ''; } catch { return ''; } }
 function idForUrl(u) { return `dex:${slugFromUrl(u)}`; }
+function decodeId(id) { try { return decodeURIComponent(id); } catch { return id; } }
+function seriesSlugFromId(id) { return decodeId(id).replace(/^dex:/, '').trim(); }
 
 async function fetchHtml(url) {
   const now = Date.now();
@@ -129,8 +147,9 @@ async function collectPages(path, targetCount = PAGE_SIZE) {
 }
 
 async function refreshCatalogHeads() {
-  for (const path of Object.values(catalogsAll)) {
-    try { await collectPages(path, PAGE_SIZE); } catch {}
+  const index = await catalogIndex();
+  for (const item of Object.values(index)) {
+    try { await collectPages(item.path, PAGE_SIZE); } catch {}
   }
 }
 
@@ -218,43 +237,56 @@ async function resolveDramaExpressEpisode(episodeUrl, depth = 0) {
   return candidates[0]?.url || null;
 }
 
-function manifest() {
+async function manifest() {
+  const index = await catalogIndex();
   return {
-    id: 'com.nv.drmshort.addon', version: '1.3.0', name: 'NV Drama Short',
-    description: 'Nuvio addon that indexes DramaExpress categories and source catalogs and resolves publicly exposed episode streams from DramaExpress pages.',
+    id: 'com.nv.drmshort.addon', version: '1.6.0', name: 'NV Drama Short',
+    description: 'Nuvio addon that dynamically mirrors DramaExpress categories and source catalogs and resolves publicly exposed episode streams from DramaExpress pages.',
     logo: 'https://dramaexpress.net/favicon.ico', resources: ['catalog','meta','stream'], types: ['series'], idPrefixes: ['dex:'],
-    catalogs: Object.keys(catalogsAll).map(id => ({ type:'series', id, name:catalogNames[id], extra:[{ name:'search', isRequired:false }, { name:'skip', isRequired:false }] })),
+    catalogs: Object.values(index).map(x => ({ type:'series', id:x.id, name:x.name, extra:[{ name:'search', isRequired:false }, { name:'skip', isRequired:false }] })),
     behaviorHints: { configurable:false, p2pNotSupported:true }
   };
 }
 
-app.get('/manifest.json', (_, res) => res.json(manifest()));
+app.get('/manifest.json', async (_, res) => {
+  try { res.json(await manifest()); } catch (e) { res.status(502).json({ error:e.message }); }
+});
 
 app.get('/catalog/series/:id.json', async (req, res) => {
-  try { const path = catalogsAll[req.params.id]; if (!path) return res.json({ metas: [] }); const items = await collectPages(path); res.json({ metas: items.slice(0, PAGE_SIZE).map(x => ({ id:x.id,type:'series',name:x.name,poster:x.poster })) }); }
-  catch (e) { res.status(502).json({ metas:[], error:e.message }); }
+  try {
+    const index = await catalogIndex();
+    const item = index[req.params.id];
+    if (!item) return res.json({ metas: [] });
+    const items = await collectPages(item.path, PAGE_SIZE);
+    res.json({ metas: items.slice(0, PAGE_SIZE).map(x => ({ id:x.id,type:'series',name:x.name,poster:x.poster })) });
+  } catch (e) { res.status(502).json({ metas:[], error:e.message }); }
 });
 
 app.get('/catalog/series/:id/:extra.json', async (req, res) => {
   try {
-    const path = catalogsAll[req.params.id]; if (!path) return res.json({ metas: [] });
-    const params = new URLSearchParams(req.params.extra); const q = clean(params.get('search')); const skip = Number(params.get('skip') || 0);
-    const items = await collectPages(path, skip + PAGE_SIZE); const filtered = q ? items.filter(x => x.name.toLowerCase().includes(q.toLowerCase())) : items;
+    const index = await catalogIndex();
+    const item = index[req.params.id];
+    if (!item) return res.json({ metas: [] });
+    const params = new URLSearchParams(req.params.extra);
+    const q = clean(params.get('search'));
+    const skip = Math.max(0, Number(params.get('skip') || 0));
+    const items = await collectPages(item.path, skip + PAGE_SIZE);
+    const filtered = q ? items.filter(x => x.name.toLowerCase().includes(q.toLowerCase())) : items;
     res.json({ metas: filtered.slice(skip, skip + PAGE_SIZE).map(x => ({ id:x.id,type:'series',name:x.name,poster:x.poster })) });
   } catch (e) { res.status(502).json({ metas:[], error:e.message }); }
 });
 
 app.get('/meta/series/:id.json', async (req, res) => {
   try {
-    const slug = req.params.id.replace(/^dex:/, ''); const url = `${BASE}/series/${slug}`; const m = parseMeta(await fetchHtml(url), url);
-    const videos = m.episodes.map(ep => ({ id:`${req.params.id}:ep:${ep.number}`, title:ep.title || `Episode ${ep.number}`, season:1, episode:ep.number, thumbnail:m.poster }));
-    res.json({ meta:{ id:req.params.id,type:'series',name:m.title,poster:m.poster,description:m.description,genres:m.genres,videos } });
+    const slug = seriesSlugFromId(req.params.id); const url = `${BASE}/series/${slug}`; const m = parseMeta(await fetchHtml(url), url);
+    const videos = m.episodes.map(ep => ({ id:`${req.params.id}:ep:${ep.number}`, title:ep.title || `Episode ${ep.number}`, season:1, episode:ep.number, thumbnail:m.poster, released: undefined }));
+    res.json({ meta:{ id:req.params.id,type:'series',name:m.title,poster:m.poster,posterShape:'poster',description:m.description,genres:m.genres,videos } });
   } catch (e) { res.status(502).json({ meta:{id:req.params.id,type:'series',name:req.params.id}, error:e.message }); }
 });
 
 app.get('/stream/series/:id.json', async (req, res) => {
   try {
-    const [seriesId, epPart] = req.params.id.split(':ep:'); const slug = seriesId.replace(/^dex:/, '');
+    const decodedId = decodeId(req.params.id); const [seriesId, epPart] = decodedId.split(':ep:'); const slug = seriesSlugFromId(seriesId);
     const pageUrl = `${BASE}/series/${slug}`; const m = parseMeta(await fetchHtml(pageUrl), pageUrl); const n = Number(epPart || 1);
     const ep = m.episodes.find(x => x.number === n) || m.episodes[n - 1]; if (!ep) return res.json({ streams:[] });
     const target = await resolveDramaExpressEpisode(ep.href);
@@ -265,6 +297,18 @@ app.get('/stream/series/:id.json', async (req, res) => {
   } catch (e) { res.status(502).json({ streams:[], error:e.message }); }
 });
 
-app.get('/health', (_, res) => res.json({ ok:true, version:'1.3.0' }));
+app.get('/meta/series/:id', async (req, res, next) => {
+  if (req.params.id.endsWith('.json')) return next();
+  try {
+    const id = decodeId(req.params.id);
+    const slug = seriesSlugFromId(id);
+    const url = `${BASE}/series/${slug}`;
+    const m = parseMeta(await fetchHtml(url), url);
+    const videos = m.episodes.map(ep => ({ id:`${id}:ep:${ep.number}`, title:ep.title || `Episode ${ep.number}`, season:1, episode:ep.number, thumbnail:m.poster }));
+    res.json({ meta:{ id,type:'series',name:m.title,poster:m.poster,posterShape:'poster',description:m.description,genres:m.genres,videos } });
+  } catch (e) { res.status(502).json({ meta:{id:req.params.id,type:'series',name:req.params.id}, error:e.message }); }
+});
+
+app.get('/health', (_, res) => res.json({ ok:true, version:'1.6.0' }));
 app.get('/', (_, res) => res.type('text').send('Nuvio DramaExpress addon is running. Use /manifest.json'));
 app.listen(PORT, '0.0.0.0', () => console.log(`DramaExpress addon listening on 0.0.0.0:${PORT}`));
