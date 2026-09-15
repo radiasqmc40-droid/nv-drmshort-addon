@@ -2,7 +2,7 @@ import express from 'express';
 import * as cheerio from 'cheerio';
 
 const app = express();
-const VERSION = '1.8.1';
+const VERSION = '1.8.2';
 const PORT = Number(process.env.PORT) || 3000;
 const BASE = 'https://dramaexpress.net';
 const UA = `Mozilla/5.0 (compatible; Nuvio-DramaExpress-Addon/${VERSION})`;
@@ -15,6 +15,7 @@ const MAX_PAGE = 1000;
 const PAGE_SIZE = 100;
 const MAX_SCRIPT_FETCHES = 8;
 const MAX_API_FETCHES = 20;
+const MAX_PROXY_BYTES = 25 * 1024 * 1024;
 
 const htmlCache = new Map();
 const catalogCache = new Map();
@@ -301,18 +302,24 @@ async function probeMediaUrl(url, referer) {
   const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
   try {
     const r = await fetch(url, {
-      method: 'HEAD',
-      headers: { 'user-agent': UA, accept: '*/*', ...(referer ? { referer } : {}) },
+      headers: {
+        'user-agent': UA,
+        accept: 'application/vnd.apple.mpegurl, application/x-mpegURL, video/*, */*',
+        ...(referer ? { referer, origin: (() => { try { return new URL(referer).origin; } catch { return BASE; } })() } : {})
+      },
       redirect: 'follow', signal: controller.signal
     });
     const ct = (r.headers.get('content-type') || '').toLowerCase();
-    return ct.startsWith('video/') || ct.includes('mpegurl') || ct.includes('vnd.apple.mpegurl') ||
-      (r.ok && isPlayableUrl(r.url || url));
+    const finalUrl = r.url || url;
+    if (!r.ok) return false;
+    if (ct.startsWith('video/') || ct.includes('mpegurl') || ct.includes('vnd.apple.mpegurl')) return true;
+    if (isPlayableUrl(finalUrl)) return true;
+    const sample = (await r.text()).slice(0, 4096);
+    return /#EXTM3U|#EXT-X-TARGETDURATION|#EXT-X-STREAM-INF/i.test(sample);
   } catch {
     return false;
   } finally { clearTimeout(timer); }
 }
-
 function rank(c) {
   const u = c.url.toLowerCase();
   let s = 0;
@@ -352,8 +359,9 @@ async function resolveDramaExpressEpisode(episodeUrl, depth = 0, seen = new Set(
     debug.scriptUrls.push(...info.scriptUrls);
   }
 
-  for (const c of info.candidates) if (isPlayableUrl(c.url)) return c.url;
-  for (const c of info.candidates.slice(0, 25)) if (await probeMediaUrl(c.url, episodeUrl)) return c.url;
+  for (const c of info.candidates.slice(0, 30)) {
+    if (await probeMediaUrl(c.url, episodeUrl)) return { url: c.url, referer: episodeUrl };
+  }
 
   for (const api of info.apiUrls.slice(0, MAX_API_FETCHES)) {
     try {
@@ -365,8 +373,7 @@ async function resolveDramaExpressEpisode(episodeUrl, depth = 0, seen = new Set(
       const fromText = [...extractConfigUrls(body, api), ...mediaCandidates(body, api)];
       const apiCandidates = [...new Set([...fromJson, ...fromText.map(x => x.url)])];
       for (const u of apiCandidates) {
-        if (isPlayableUrl(u)) return u;
-        if (await probeMediaUrl(u, api)) return u;
+        if (await probeMediaUrl(u, api)) return { url: u, referer: api };
       }
     } catch (e) {
       if (debug) debug.errors.push(`${api}: ${e.message}`);
@@ -379,8 +386,7 @@ async function resolveDramaExpressEpisode(episodeUrl, depth = 0, seen = new Set(
       const candidates = [...extractConfigUrls(js, script), ...mediaCandidates(js, script)].sort((a,b) => rank(b) - rank(a));
       if (debug) debug.scriptResponses.push({ url: script, candidates: candidates.slice(0, 30).map(x => x.url) });
       for (const c of candidates) {
-        if (isPlayableUrl(c.url)) return c.url;
-        if (await probeMediaUrl(c.url, script)) return c.url;
+        if (await probeMediaUrl(c.url, script)) return { url: c.url, referer: script };
       }
     } catch (e) {
       if (debug) debug.errors.push(`${script}: ${e.message}`);
@@ -395,6 +401,92 @@ async function resolveDramaExpressEpisode(episodeUrl, depth = 0, seen = new Set(
   }
   return null;
 }
+
+function publicOrigin(req) {
+  const proto = req.get('x-forwarded-proto') || req.protocol || 'https';
+  const host = req.get('x-forwarded-host') || req.get('host');
+  return `${proto}://${host}`;
+}
+
+function proxyUrl(req, target, referer) {
+  const q = new URLSearchParams({ url: target });
+  if (referer) q.set('ref', referer);
+  return `${publicOrigin(req)}/proxy/media?${q.toString()}`;
+}
+
+async function fetchUpstream(url, referer, headers = {}) {
+  const h = {
+    'user-agent': UA,
+    accept: '*/*',
+    ...(referer ? {
+      referer,
+      origin: (() => { try { return new URL(referer).origin; } catch { return BASE; } })()
+    } : {}),
+    ...headers
+  };
+  return fetch(url, { headers: h, redirect: 'follow' });
+}
+
+function rewriteHlsManifest(body, upstreamUrl, req, referer) {
+  const base = upstreamUrl;
+  const proxify = value => proxyUrl(req, abs(value, base), referer || upstreamUrl);
+  return body.split(/\r?\n/).map(line => {
+    if (!line || line.startsWith('#')) {
+      return line.replace(/URI="([^"]+)"/g, (_, v) => `URI="${proxify(v)}"`);
+    }
+    return proxify(line.trim());
+  }).join('\n');
+}
+
+app.get('/proxy/media', async (req, res) => {
+  const target = String(req.query.url || '');
+  const referer = String(req.query.ref || '');
+  if (!/^https?:\/\//i.test(target)) return res.status(400).send('Bad media URL');
+
+  try {
+    const range = req.get('range');
+    const upstream = await fetchUpstream(target, referer, range ? { range } : {});
+    if (!upstream.ok && upstream.status !== 206) {
+      return res.status(upstream.status).send(`Upstream ${upstream.status}`);
+    }
+
+    const ct = (upstream.headers.get('content-type') || '').toLowerCase();
+    const looksHls = ct.includes('mpegurl') || ct.includes('vnd.apple.mpegurl') || /\.m3u8(?:\?|$)/i.test(upstream.url || target);
+    if (looksHls) {
+      const body = await upstream.text();
+      if (body.length > MAX_PROXY_BYTES) return res.status(502).send('Manifest too large');
+      res.setHeader('content-type', ct || 'application/vnd.apple.mpegurl');
+      res.setHeader('cache-control', 'no-store');
+      return res.send(rewriteHlsManifest(body, upstream.url || target, req, referer));
+    }
+
+    const contentLength = Number(upstream.headers.get('content-length') || 0);
+    if (contentLength && contentLength > MAX_PROXY_BYTES) return res.status(502).send('Media too large for proxy');
+    res.status(upstream.status);
+    for (const h of ['content-type','content-length','content-range','accept-ranges','etag','last-modified']) {
+      const v = upstream.headers.get(h);
+      if (v) res.setHeader(h, v);
+    }
+    res.setHeader('cache-control', 'no-store');
+    if (upstream.body) {
+      const reader = upstream.body.getReader();
+      const pump = async () => {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!res.write(Buffer.from(value))) await new Promise(resolve => res.once('drain', resolve));
+          }
+          res.end();
+        } catch { res.destroy(); }
+      };
+      return pump();
+    }
+    return res.end();
+  } catch (e) {
+    res.status(502).send(`Proxy error: ${e.message}`);
+  }
+});
 
 async function buildMeta(id) {
   const slug = seriesSlugFromId(id);
@@ -480,12 +572,12 @@ app.get('/stream/series/:id.json', async (req, res) => {
     const ep = m.episodes.find(x => x.number === n) || m.episodes[n - 1];
     if (!ep) return res.json({ streams: [] });
 
-    const target = await resolveDramaExpressEpisode(ep.href);
-    if (!target) return res.json({ streams: [] });
+    const resolved = await resolveDramaExpressEpisode(ep.href);
+    if (!resolved?.url) return res.json({ streams: [] });
 
     res.json({ streams: [{
       title: ep.title || `Episode ${n}`,
-      url: target,
+      url: proxyUrl(req, resolved.url, resolved.referer || ep.href),
       behaviorHints: { bingeGroup: 'dramaexpress', videoOrientation: 'portrait' }
     }] });
   } catch (e) { res.status(502).json({ streams: [], error: e.message }); }
@@ -506,8 +598,11 @@ app.get('/stream-debug/series/:id.json', async (req, res) => {
       ok: true, version: VERSION, episode: ep.href, visited: [], candidates: [],
       apiUrls: [], apiResponses: [], scriptUrls: [], scriptResponses: [], errors: []
     };
-    debug.stream = await resolveDramaExpressEpisode(ep.href, 0, new Set(), debug);
-    debug.resolved = Boolean(debug.stream);
+    const resolved = await resolveDramaExpressEpisode(ep.href, 0, new Set(), debug);
+    debug.stream = resolved?.url || null;
+    debug.streamReferer = resolved?.referer || null;
+    debug.resolved = Boolean(resolved?.url);
+    debug.proxyStream = resolved?.url ? proxyUrl(req, resolved.url, resolved.referer || ep.href) : null;
     res.json(debug);
   } catch (e) { res.status(502).json({ ok: false, version: VERSION, error: e.message }); }
 });

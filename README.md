@@ -1,4 +1,4 @@
-# NV Drama Short 1.8.1
+# NV Drama Short 1.8.2
 
 Nuvio addon for DramaExpress.
 
@@ -18,4 +18,4 @@ Requires Node.js 20+.
 - `/stream/...`
 - `/stream-debug/...`
 
-Version is explicitly `1.8.1` in `package.json`, `server.js`, manifest, health response, and startup log.
+Version is explicitly `1.8.2` in `package.json`, `server.js`, manifest, health response, and startup log.
