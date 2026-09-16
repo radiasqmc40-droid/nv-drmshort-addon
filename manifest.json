@@ -1,6 +1,6 @@
 {
   "id": "com.nv.drmshort.addon",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "name": "NV Drama Short Public",
   "description": "Nuvio addon using public provider APIs/public pages only. DramaExpress is disabled.",
   "logo": "https://everydrama.com/favicon.ico",

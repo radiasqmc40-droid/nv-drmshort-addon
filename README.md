@@ -1,4 +1,4 @@
-# NV Drama Short Public v2.0.0
+# NV Drama Short Public v2.0.1
 
 Nuvio/Stremio-protocol addon that no longer depends on DramaExpress.
 
