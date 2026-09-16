@@ -2,21 +2,22 @@ import express from 'express';
 import * as cheerio from 'cheerio';
 
 const app = express();
-const VERSION = '1.8.3';
+const VERSION = '1.8.4';
 const PORT = Number(process.env.PORT) || 3000;
 const BASE = 'https://dramaexpress.net';
 const UA = `Mozilla/5.0 (compatible; Nuvio-DramaExpress-Addon/${VERSION})`;
 const CACHE_MS = 10 * 60 * 1000;
 const CATALOG_CACHE_MS = 30 * 60 * 1000;
 const DISCOVERY_CACHE_MS = 30 * 60 * 1000;
-const FETCH_TIMEOUT_MS = 12000;
-const PROBE_TIMEOUT_MS = 7000;
+const FETCH_TIMEOUT_MS = 5000;
+const RESOLVE_DEADLINE_MS = 20000;
+const PROBE_TIMEOUT_MS = 3500;
 const MAX_PAGE = 1000;
 const PAGE_SIZE = 100;
-const MAX_SCRIPT_FETCHES = 8;
-const MAX_API_FETCHES = 30;
+const MAX_SCRIPT_FETCHES = 4;
+const MAX_API_FETCHES = 8;
 const MAX_INLINE_SCAN = 20;
-const MAX_DISCOVERED_FETCHES = 30;
+const MAX_DISCOVERED_FETCHES = 12;
 const MAX_PROXY_BYTES = 25 * 1024 * 1024;
 
 const htmlCache = new Map();
@@ -420,8 +421,8 @@ async function inspectPage(url, referer) {
   };
 }
 
-async function resolveDramaExpressEpisode(episodeUrl, depth = 0, seen = new Set(), debug = null) {
-  if (depth > 4 || seen.has(episodeUrl)) return null;
+async function resolveDramaExpressEpisode(episodeUrl, depth = 0, seen = new Set(), debug = null, deadline = Date.now() + RESOLVE_DEADLINE_MS) {
+  if (Date.now() >= deadline || depth > 4 || seen.has(episodeUrl)) return null;
   seen.add(episodeUrl);
   if (debug) debug.visited.push(episodeUrl);
 
@@ -436,11 +437,13 @@ async function resolveDramaExpressEpisode(episodeUrl, depth = 0, seen = new Set(
     debug.playerLinks.push(...(info.playerLinks || []));
   }
 
-  for (const c of info.candidates.slice(0, 30)) {
+  for (const c of info.candidates.slice(0, 20)) {
+    if (Date.now() >= deadline) return null;
     if (await probeMediaUrl(c.url, episodeUrl)) return { url: c.url, referer: episodeUrl };
   }
 
   for (const api of info.apiUrls.slice(0, MAX_API_FETCHES)) {
+    if (Date.now() >= deadline) return null;
     try {
       const body = await fetchText(api, { referer: episodeUrl, accept: 'application/json,text/plain,*/*' }, false);
       if (debug) debug.apiResponses.push({ url: api, preview: body.slice(0, 1200) });
@@ -458,6 +461,7 @@ async function resolveDramaExpressEpisode(episodeUrl, depth = 0, seen = new Set(
   }
 
   for (const script of info.scriptUrls.slice(0, MAX_SCRIPT_FETCHES)) {
+    if (Date.now() >= deadline) return null;
     try {
       const js = await fetchText(script, { referer: episodeUrl }, false);
       const candidates = [...extractConfigUrls(js, script), ...mediaCandidates(js, script)].sort((a,b) => rank(b) - rank(a));
@@ -471,6 +475,7 @@ async function resolveDramaExpressEpisode(episodeUrl, depth = 0, seen = new Set(
   }
 
   for (const player of (info.playerLinks || []).slice(0, MAX_DISCOVERED_FETCHES)) {
+    if (Date.now() >= deadline) return null;
     if (seen.has(player)) continue;
     try {
       const body = await fetchText(player, { referer: episodeUrl }, false);
@@ -485,16 +490,17 @@ async function resolveDramaExpressEpisode(episodeUrl, depth = 0, seen = new Set(
         const u = typeof c === 'string' ? c : c.url;
         if (u && await probeMediaUrl(u, player)) return { url: u, referer: player };
       }
-      const nested = await resolveDramaExpressEpisode(player, depth + 1, seen, debug);
+      const nested = await resolveDramaExpressEpisode(player, depth + 1, seen, debug, deadline);
       if (nested) return nested;
     } catch (e) {
       if (debug) debug.errors.push(`${player}: ${e.message}`);
     }
   }
 
-  for (const c of info.candidates.filter(x => x.kind === 'embed').slice(0, 8)) {
+  for (const c of info.candidates.filter(x => x.kind === 'embed').slice(0, 5)) {
+    if (Date.now() >= deadline) return null;
     try {
-      const nested = await resolveDramaExpressEpisode(c.url, depth + 1, seen, debug);
+      const nested = await resolveDramaExpressEpisode(c.url, depth + 1, seen, debug, deadline);
       if (nested) return nested;
     } catch {}
   }
@@ -671,7 +677,7 @@ app.get('/stream/series/:id.json', async (req, res) => {
     const ep = m.episodes.find(x => x.number === n) || m.episodes[n - 1];
     if (!ep) return res.json({ streams: [] });
 
-    const resolved = await resolveDramaExpressEpisode(ep.href);
+    const resolved = await resolveDramaExpressEpisode(ep.href, 0, new Set(), null, Date.now() + RESOLVE_DEADLINE_MS);
     if (!resolved?.url) return res.json({ streams: [] });
 
     res.json({ streams: [{
@@ -697,7 +703,10 @@ app.get('/stream-debug/series/:id.json', async (req, res) => {
       ok: true, version: VERSION, episode: ep.href, visited: [], candidates: [],
       apiUrls: [], apiResponses: [], scriptUrls: [], scriptResponses: [], playerLinks: [], playerResponses: [], errors: []
     };
-    const resolved = await resolveDramaExpressEpisode(ep.href, 0, new Set(), debug);
+    const deadline = Date.now() + RESOLVE_DEADLINE_MS;
+    const resolved = await resolveDramaExpressEpisode(ep.href, 0, new Set(), debug, deadline);
+    debug.deadlineMs = RESOLVE_DEADLINE_MS;
+    debug.timedOut = Date.now() >= deadline && !resolved?.url;
     debug.stream = resolved?.url || null;
     debug.streamReferer = resolved?.referer || null;
     debug.resolved = Boolean(resolved?.url);
