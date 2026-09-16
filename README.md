@@ -1,32 +1,24 @@
-# NV Drama Short 1.9.0
+# NV Drama Short Public v2.0.0
 
-Bản 1.9.0 ưu tiên nguồn phát public từ các provider short-drama thông qua một public REST gateway, thay vì phụ thuộc vào việc DramaExpress phải expose player trực tiếp.
+Nuvio/Stremio-protocol addon that no longer depends on DramaExpress.
 
-## Public playback providers
+## Sources
 
-- DramaBox
-- FlareFlow
-- FlickReels
-- GoodShort
-- JoyReels
-- KalosTV
-- MoboReels
-- NetShort
-- Reelshort
-- Stardust
-- ShortWave
+The addon exposes exactly the requested 17 catalogs:
 
-Khi mở một tập, addon lấy tên phim từ ID/slug, tìm phim tương ứng trên các provider public ở trên, lấy stream của đúng episode rồi trả URL stream cho Nuvio. Nếu không tìm được public source, addon mới fallback về resolver DramaExpress cũ.
-
-## Giữ danh sách source DramaExpress
-
-Danh sách catalog gốc vẫn giữ các source đã yêu cầu:
 DramaBox, FlareFlow, FlickReels, GoodShort, JoyReels, KalosTV, MoboReels, MoreShort, MyDramaWave, NetShort, PetaDrama, Reelshort, Shortical, ShortTV, ShortWave, Stardust, StoryReel.
 
-FlexTV không được thêm.
+FlexTV is intentionally excluded.
 
-## Lưu ý
+## Public-source architecture
 
-Nguồn public gateway hiện không có đủ cả 17 provider trên; 11 provider ở trên có public playback API. Các provider còn lại vẫn được giữ trong danh sách DramaExpress nhưng chưa được giả mạo URL playback khi không có nguồn public tương ứng.
+- DramaExpress is completely removed from the runtime code, manifest, logo, IDs, catalog discovery, metadata, and stream resolver.
+- For providers with documented public REST endpoints, the addon uses DramaBos public API routes for search, detail, episodes, and HLS playback.
+- For providers without a documented public endpoint in the integration, the addon falls back to EveryDrama public pages and attempts to discover catalog entries and openly exposed media URLs.
+- No DRM bypass, authentication bypass, or paid-access bypass is implemented.
 
-Node 20+, PORT từ môi trường, bind 0.0.0.0.
+## Deployment
+
+Node 20+, `npm install`, `npm start`, health check `/health`, manifest `/manifest.json`.
+
+The addon is designed for automatic runtime refresh and does not store a fixed movie database.
