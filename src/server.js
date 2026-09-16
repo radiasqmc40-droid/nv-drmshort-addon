@@ -2,16 +2,17 @@ import express from 'express';
 import * as cheerio from 'cheerio';
 
 const app = express();
-const VERSION = '1.8.4';
+const VERSION = '1.8.5';
 const PORT = Number(process.env.PORT) || 3000;
 const BASE = 'https://dramaexpress.net';
 const UA = `Mozilla/5.0 (compatible; Nuvio-DramaExpress-Addon/${VERSION})`;
 const CACHE_MS = 10 * 60 * 1000;
 const CATALOG_CACHE_MS = 30 * 60 * 1000;
 const DISCOVERY_CACHE_MS = 30 * 60 * 1000;
-const FETCH_TIMEOUT_MS = 5000;
-const RESOLVE_DEADLINE_MS = 20000;
-const PROBE_TIMEOUT_MS = 3500;
+const FETCH_TIMEOUT_MS = 3000;
+const RESOLVE_DEADLINE_MS = 7000;
+const PROBE_TIMEOUT_MS = 2000;
+const DEBUG_FETCH_TIMEOUT_MS = 2500;
 const MAX_PAGE = 1000;
 const PAGE_SIZE = 100;
 const MAX_SCRIPT_FETCHES = 4;
@@ -232,7 +233,15 @@ function addCandidate(list, value, base, kind = 'unknown') {
 
 function extractAbsoluteUrls(text, base, kind, list) {
   const raw = decodeEscaped(text);
-  for (const m of raw.matchAll(/https?:\/\/[^"'<>\s\\]+/g)) addCandidate(list, m[0], base, kind);
+  // Only keep URLs that have a realistic player/media/API shape. Do not turn
+  // social-share links, schema.org, site navigation, or CDN image hosts into
+  // resolver candidates.
+  for (const m of raw.matchAll(/https?:\/\/[^"'<>\s\\]+/g)) {
+    const u = normalizeUrlValue(m[0]);
+    if (/\.(?:m3u8|mp4)(?:\?|$)/i.test(u) || /(?:player|embed|iframe|stream|video|playback|media|playlist|\.json(?:\?|$)|\/api(?:\/|\?|$)|\/ajax(?:\/|\?|$)|\/graphql(?:\/|\?|$))/i.test(u)) {
+      addCandidate(list, u, base, kind);
+    }
+  }
 }
 
 function mediaCandidates(html, pageUrl) {
@@ -325,13 +334,16 @@ function extractApiUrls(html, pageUrl) {
     if (!value || typeof value !== 'string') return;
     const u = abs(decodeEscaped(value.trim()), pageUrl);
     if (!u || isBadUrl(u) || out.includes(u)) return;
-    if (/\/api(?:\/|\?|$)|\/ajax(?:\/|\?|$)|\/graphql(?:\/|\?|$)|\.json(?:\?|$)/i.test(u)) out.push(u);
+    if (/\/api(?:\/|\?|$)|\/ajax(?:\/|\?|$)|\/graphql(?:\/|\?|$)|\.json(?:\?|$)|(?:player|playback|stream|video|media)/i.test(u)) out.push(u);
   };
-  for (const m of decodeEscaped(html).matchAll(/(?:https?:\/\/[^"'<> \s]+|\/(?:[^"'<> \s]+(?:\/api\/|\/ajax\/|\/graphql\/|\.json(?:\?|$))[^"'<> \s]*))/gi)) add(m[0]);
+  // Only inspect actual script/data attributes and JS fetch/XHR strings.
   const $ = cheerio.load(html);
-  $('script[src]').each((_, el) => {
-    const src = abs($(el).attr('src'), pageUrl);
-    if (src && /api|ajax|graphql|\.json/i.test(src) && !out.includes(src)) out.push(src);
+  $('script:not([src])').slice(0, MAX_INLINE_SCAN).each((_, el) => {
+    const txt = $(el).text() || '';
+    for (const m of txt.matchAll(/(?:https?:\/\/[^"'<>\s]+|\/(?:api|ajax|graphql|player|play|video|stream|media|episode|episodes)[^"'<>\s]*)/gi)) add(m[0]);
+  });
+  $('*[data-api], *[data-endpoint], *[data-play], *[data-player], *[data-stream], *[data-video]').each((_, el) => {
+    for (const k of ['data-api','data-endpoint','data-play','data-player','data-stream','data-video']) add($(el).attr(k));
   });
   return out.slice(0, MAX_API_FETCHES);
 }
@@ -437,7 +449,8 @@ async function resolveDramaExpressEpisode(episodeUrl, depth = 0, seen = new Set(
     debug.playerLinks.push(...(info.playerLinks || []));
   }
 
-  for (const c of info.candidates.slice(0, 20)) {
+  const directCandidates = info.candidates.filter(c => /(?:m3u8|mp4|stream|video|playback|media|player|embed)/i.test(c.url));
+  for (const c of directCandidates.slice(0, 8)) {
     if (Date.now() >= deadline) return null;
     if (await probeMediaUrl(c.url, episodeUrl)) return { url: c.url, referer: episodeUrl };
   }
@@ -505,6 +518,22 @@ async function resolveDramaExpressEpisode(episodeUrl, depth = 0, seen = new Set(
     } catch {}
   }
   return null;
+}
+
+async function testUpstream(url) {
+  const started = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), DEBUG_FETCH_TIMEOUT_MS);
+  try {
+    const r = await fetch(url, {
+      headers: { 'user-agent': UA, 'accept-language': 'en-US,en;q=0.8', accept: 'text/html,application/xhtml+xml,*/*;q=0.8' },
+      redirect: 'follow', signal: controller.signal
+    });
+    const body = await r.text();
+    return { ok: r.ok, status: r.status, elapsedMs: Date.now()-started, finalUrl: r.url, contentType: r.headers.get('content-type') || '', bytes: Buffer.byteLength(body), preview: body.slice(0, 300) };
+  } catch (e) {
+    return { ok: false, elapsedMs: Date.now()-started, error: e.name === 'AbortError' ? 'timeout' : e.message };
+  } finally { clearTimeout(timer); }
 }
 
 function publicOrigin(req) {
@@ -688,31 +717,44 @@ app.get('/stream/series/:id.json', async (req, res) => {
   } catch (e) { res.status(502).json({ streams: [], error: e.message }); }
 });
 
+app.get('/debug-upstream', async (req, res) => {
+  const url = String(req.query.url || `${BASE}/series/upgrade/episode-1`);
+  if (!/^https?:\/\//i.test(url)) return res.status(400).json({ ok: false, error: 'Bad URL' });
+  res.json({ version: VERSION, target: url, ...(await testUpstream(url)) });
+});
+
 app.get('/stream-debug/series/:id.json', async (req, res) => {
+  const started = Date.now();
+  const hardDeadline = started + RESOLVE_DEADLINE_MS;
+  const debug = { ok: true, version: VERSION, episode: null, visited: [], candidates: [], apiUrls: [], apiResponses: [], scriptUrls: [], scriptResponses: [], playerLinks: [], playerResponses: [], errors: [], deadlineMs: RESOLVE_DEADLINE_MS, timedOut: false, stream: null, streamReferer: null, resolved: false, proxyStream: null };
   try {
     const decodedId = decodeId(req.params.id);
     const [seriesId, epPart] = decodedId.split(':ep:');
     const slug = seriesSlugFromId(seriesId);
     const pageUrl = `${BASE}/series/${slug}`;
-    const m = parseMeta(await fetchHtml(pageUrl), pageUrl);
+    if (Date.now() >= hardDeadline) throw new Error('resolver deadline exceeded before metadata fetch');
+    const m = await fetchHtml(pageUrl);
+    if (Date.now() >= hardDeadline) throw new Error('resolver deadline exceeded after metadata fetch');
     const n = Number(epPart || 1);
-    const ep = m.episodes.find(x => x.number === n) || m.episodes[n - 1];
-    if (!ep) return res.json({ ok: false, stage: 'episode', message: 'Episode not found' });
-
-    const debug = {
-      ok: true, version: VERSION, episode: ep.href, visited: [], candidates: [],
-      apiUrls: [], apiResponses: [], scriptUrls: [], scriptResponses: [], playerLinks: [], playerResponses: [], errors: []
-    };
-    const deadline = Date.now() + RESOLVE_DEADLINE_MS;
-    const resolved = await resolveDramaExpressEpisode(ep.href, 0, new Set(), debug, deadline);
-    debug.deadlineMs = RESOLVE_DEADLINE_MS;
-    debug.timedOut = Date.now() >= deadline && !resolved?.url;
+    const parsed = parseMeta(m, pageUrl);
+    const ep = parsed.episodes.find(x => x.number === n) || parsed.episodes[n - 1];
+    if (!ep) return res.json({ ...debug, ok: false, stage: 'episode', message: 'Episode not found', totalMs: Date.now()-started });
+    debug.episode = ep.href;
+    const resolved = await resolveDramaExpressEpisode(ep.href, 0, new Set(), debug, hardDeadline);
+    debug.timedOut = Date.now() >= hardDeadline && !resolved?.url;
     debug.stream = resolved?.url || null;
     debug.streamReferer = resolved?.referer || null;
     debug.resolved = Boolean(resolved?.url);
     debug.proxyStream = resolved?.url ? proxyUrl(req, resolved.url, resolved.referer || ep.href) : null;
-    res.json(debug);
-  } catch (e) { res.status(502).json({ ok: false, version: VERSION, error: e.message }); }
+    debug.totalMs = Date.now() - started;
+    return res.json(debug);
+  } catch (e) {
+    debug.ok = false;
+    debug.errors.push(e.message);
+    debug.timedOut = Date.now() >= hardDeadline || /deadline|timeout/i.test(e.message);
+    debug.totalMs = Date.now() - started;
+    return res.json(debug);
+  }
 });
 
 app.get('/health', (_, res) => res.json({ ok: true, version: VERSION, port: PORT }));
