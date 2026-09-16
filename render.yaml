@@ -3,6 +3,6 @@ services:
     name: nv-drmshort-addon
     runtime: node
     plan: free
-    buildCommand: npm install
+    buildCommand: npm install && npm run build
     startCommand: npm start
     healthCheckPath: /health

@@ -1,15 +1,11 @@
 {
   "name": "nv-drmshort-addon",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "node --check src/server.js",
     "start": "node src/server.js"
-  },
-  "dependencies": {
-    "cheerio": "^1.1.2",
-    "express": "^5.1.0"
   },
   "engines": {
     "node": ">=20"

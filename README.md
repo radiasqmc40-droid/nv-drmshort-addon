@@ -1,24 +1,16 @@
-# NV Drama Short Public v2.0.1
+# NV Drama Short Public 2.0.2
 
-Nuvio/Stremio-protocol addon that no longer depends on DramaExpress.
+- DramaExpress is completely removed.
+- Uses Node 20 native `http` and `fetch`; no runtime npm dependencies.
+- Exposes the requested 17 source names.
+- Public playback API is verified in this build for 11 sources:
+  DramaBox, FlareFlow, FlickReels, GoodShort, JoyReels, KalosTV,
+  MoboReels, NetShort, Reelshort, ShortWave, Stardust.
+- MoreShort, MyDramaWave, PetaDrama, Shortical, ShortTV, StoryReel remain
+  listed but their public playback endpoints were not verified.
 
-## Sources
+## Abasthan
+Build: `npm install && npm run build`
+Start: `npm start`
 
-The addon exposes exactly the requested 17 catalogs:
-
-DramaBox, FlareFlow, FlickReels, GoodShort, JoyReels, KalosTV, MoboReels, MoreShort, MyDramaWave, NetShort, PetaDrama, Reelshort, Shortical, ShortTV, ShortWave, Stardust, StoryReel.
-
-FlexTV is intentionally excluded.
-
-## Public-source architecture
-
-- DramaExpress is completely removed from the runtime code, manifest, logo, IDs, catalog discovery, metadata, and stream resolver.
-- For providers with documented public REST endpoints, the addon uses DramaBos public API routes for search, detail, episodes, and HLS playback.
-- For providers without a documented public endpoint in the integration, the addon falls back to EveryDrama public pages and attempts to discover catalog entries and openly exposed media URLs.
-- No DRM bypass, authentication bypass, or paid-access bypass is implemented.
-
-## Deployment
-
-Node 20+, `npm install`, `npm start`, health check `/health`, manifest `/manifest.json`.
-
-The addon is designed for automatic runtime refresh and does not store a fixed movie database.
+The server listens on `0.0.0.0` and uses `process.env.PORT`.

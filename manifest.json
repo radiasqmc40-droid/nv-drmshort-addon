@@ -1,30 +1,57 @@
 {
-  "id": "com.nv.drmshort.addon",
-  "version": "2.0.1",
+  "id": "nv.drmshort.public",
+  "version": "2.0.2",
   "name": "NV Drama Short Public",
-  "description": "Nuvio addon using public provider APIs/public pages only. DramaExpress is disabled.",
-  "logo": "https://everydrama.com/favicon.ico",
-  "resources": ["catalog", "meta", "stream"],
-  "types": ["series"],
-  "idPrefixes": ["pub:"],
-  "catalogs": [
-    {"type":"series","id":"dramabox","name":"DramaBox","extra":[{"name":"search","isRequired":false},{"name":"skip","isRequired":false}]},
-    {"type":"series","id":"flareflow","name":"FlareFlow","extra":[{"name":"search","isRequired":false},{"name":"skip","isRequired":false}]},
-    {"type":"series","id":"flickreels","name":"FlickReels","extra":[{"name":"search","isRequired":false},{"name":"skip","isRequired":false}]},
-    {"type":"series","id":"goodshort","name":"GoodShort","extra":[{"name":"search","isRequired":false},{"name":"skip","isRequired":false}]},
-    {"type":"series","id":"joyreels","name":"JoyReels","extra":[{"name":"search","isRequired":false},{"name":"skip","isRequired":false}]},
-    {"type":"series","id":"kalostv","name":"KalosTV","extra":[{"name":"search","isRequired":false},{"name":"skip","isRequired":false}]},
-    {"type":"series","id":"moboreels","name":"MoboReels","extra":[{"name":"search","isRequired":false},{"name":"skip","isRequired":false}]},
-    {"type":"series","id":"moreshort","name":"MoreShort","extra":[{"name":"search","isRequired":false},{"name":"skip","isRequired":false}]},
-    {"type":"series","id":"mydramawave","name":"MyDramaWave","extra":[{"name":"search","isRequired":false},{"name":"skip","isRequired":false}]},
-    {"type":"series","id":"netshort","name":"NetShort","extra":[{"name":"search","isRequired":false},{"name":"skip","isRequired":false}]},
-    {"type":"series","id":"petadrama","name":"PetaDrama","extra":[{"name":"search","isRequired":false},{"name":"skip","isRequired":false}]},
-    {"type":"series","id":"reelshort","name":"Reelshort","extra":[{"name":"search","isRequired":false},{"name":"skip","isRequired":false}]},
-    {"type":"series","id":"shortical","name":"Shortical","extra":[{"name":"search","isRequired":false},{"name":"skip","isRequired":false}]},
-    {"type":"series","id":"shorttv","name":"ShortTV","extra":[{"name":"search","isRequired":false},{"name":"skip","isRequired":false}]},
-    {"type":"series","id":"shortwave","name":"ShortWave","extra":[{"name":"search","isRequired":false},{"name":"skip","isRequired":false}]},
-    {"type":"series","id":"stardusttv","name":"Stardust","extra":[{"name":"search","isRequired":false},{"name":"skip","isRequired":false}]},
-    {"type":"series","id":"storyreel","name":"StoryReel","extra":[{"name":"search","isRequired":false},{"name":"skip","isRequired":false}]}
+  "description": "Public short-drama catalogs and streams. DramaExpress removed.",
+  "resources": [
+    {
+      "name": "catalog",
+      "types": [
+        "series"
+      ],
+      "idPrefixes": [
+        ""
+      ]
+    },
+    {
+      "name": "meta",
+      "types": [
+        "series"
+      ],
+      "idPrefixes": [
+        ""
+      ]
+    },
+    {
+      "name": "stream",
+      "types": [
+        "series"
+      ],
+      "idPrefixes": [
+        ""
+      ]
+    }
   ],
-  "behaviorHints": {"configurable": false, "p2pNotSupported": true}
+  "types": [
+    "series"
+  ],
+  "idPrefixes": [
+    "dramabox",
+    "flareflow",
+    "flickreels",
+    "goodshort",
+    "joyreels",
+    "kalostv",
+    "moboreels",
+    "moreshort",
+    "mydramawave",
+    "netshort",
+    "petadrama",
+    "reelshort",
+    "shortical",
+    "shorttv",
+    "shortswave",
+    "stardusttv",
+    "storyreel"
+  ]
 }
