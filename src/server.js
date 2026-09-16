@@ -2,9 +2,18 @@ import express from 'express';
 import * as cheerio from 'cheerio';
 
 const app = express();
-const VERSION = '1.8.6-test';
+const VERSION = '1.9.0';
 const PORT = Number(process.env.PORT) || 3000;
 const BASE = 'https://dramaexpress.net';
+const PUBLIC_API_BASE = 'https://dramabos.live';
+const PUBLIC_PROVIDERS = {
+  DramaBox: 'dramabox', FlareFlow: 'flareflow', FlickReels: 'flickreels', GoodShort: 'goodshort',
+  JoyReels: 'joyreels', KalosTV: 'kalostv', MoboReels: 'moboreels', NetShort: 'netshort',
+  Reelshort: 'reelshort', Stardust: 'stardusttv', ShortWave: 'shortswave'
+};
+const PUBLIC_PROVIDER_LIST = Object.entries(PUBLIC_PROVIDERS);
+const PUBLIC_FETCH_TIMEOUT_MS = 4500;
+const publicSearchCache = new Map();
 const UA = `Mozilla/5.0 (compatible; Nuvio-DramaExpress-Addon/${VERSION})`;
 const CACHE_MS = 10 * 60 * 1000;
 const CATALOG_CACHE_MS = 30 * 60 * 1000;
@@ -622,18 +631,110 @@ app.get('/proxy/media', async (req, res) => {
   }
 });
 
+
+function normalizeTitleForMatch(s) {
+  return clean(String(s || '').toLowerCase())
+    .replace(/[^a-z0-9\u00c0-\u024f\u4e00-\u9fff]+/gi, ' ')
+    .replace(/\s+/g, ' ').trim();
+}
+
+function titleFromSeriesId(id) {
+  const slug = seriesSlugFromId(id);
+  return labelFromSlug(slug);
+}
+
+async function publicApiJson(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PUBLIC_FETCH_TIMEOUT_MS);
+  try {
+    const r = await fetch(url, { headers: { 'user-agent': UA, accept: 'application/json' }, redirect: 'follow', signal: controller.signal });
+    if (!r.ok) throw new Error(`Public API ${r.status}`);
+    return await r.json();
+  } finally { clearTimeout(timer); }
+}
+
+async function searchPublicProvider(provider, title) {
+  const key = `${provider}|${normalizeTitleForMatch(title)}`;
+  const hit = publicSearchCache.get(key);
+  if (hit && Date.now() - hit.time < CATALOG_CACHE_MS) return hit.value;
+  try {
+    const url = `${PUBLIC_API_BASE}/${provider}/api/v1/search?keyword=${encodeURIComponent(title)}`;
+    const json = await publicApiJson(url);
+    const data = Array.isArray(json?.data) ? json.data : Array.isArray(json?.results) ? json.results : [];
+    const wanted = normalizeTitleForMatch(title);
+    const ranked = data.map(x => {
+      const t = normalizeTitleForMatch(x.title || x.name || '');
+      let score = 0;
+      if (t === wanted) score += 100;
+      if (t.includes(wanted) || wanted.includes(t)) score += 50;
+      const a = new Set(t.split(' ')); const b = wanted.split(' ');
+      score += b.filter(w => a.has(w)).length * 5;
+      return { ...x, _score: score };
+    }).sort((a,b) => b._score - a._score);
+    const value = ranked[0] || null;
+    publicSearchCache.set(key, { time: Date.now(), value });
+    return value;
+  } catch { return null; }
+}
+
+async function findPublicSource(title) {
+  const results = await Promise.all(PUBLIC_PROVIDER_LIST.map(async ([name, provider]) => {
+    const item = await searchPublicProvider(provider, title);
+    return item ? { name, provider, item } : null;
+  }));
+  return results.filter(Boolean).sort((a,b) => (b.item._score || 0) - (a.item._score || 0))[0] || null;
+}
+
+async function publicSourceStream(title, episode) {
+  const found = await findPublicSource(title);
+  if (!found?.item?.id) return null;
+  const id = encodeURIComponent(found.item.id);
+  const url = `${PUBLIC_API_BASE}/${found.provider}/api/v1/play/${id}/${encodeURIComponent(episode)}`;
+  try {
+    const json = await publicApiJson(url);
+    const candidates = [];
+    const walk = (v) => {
+      if (!v) return;
+      if (typeof v === 'string' && /^https?:\/\//i.test(v) && /(?:m3u8|mp4|stream|video|cdn)/i.test(v)) candidates.push(v);
+      else if (Array.isArray(v)) v.forEach(walk);
+      else if (typeof v === 'object') Object.values(v).forEach(walk);
+    };
+    walk(json);
+    const stream = candidates.find(u => /\.m3u8(?:\?|$)/i.test(u)) || candidates[0];
+    if (!stream) return null;
+    return { url: stream, provider: found.name, providerId: found.item.id, title: found.item.title || title };
+  } catch { return null; }
+}
+
+async function publicSourceMeta(id) {
+  const title = titleFromSeriesId(id);
+  const found = await findPublicSource(title);
+  if (!found?.item?.id) return null;
+  try {
+    const detail = await publicApiJson(`${PUBLIC_API_BASE}/${found.provider}/api/v1/detail/${encodeURIComponent(found.item.id)}`);
+    const d = detail?.data || detail?.result || detail || {};
+    const eps = Number(d.episodes || d.chapterCount || found.item.episodes || 0);
+    const poster = d.cover || d.poster || found.item.cover || null;
+    const name = d.title || d.name || found.item.title || title;
+    const videos = Array.from({ length: eps }, (_, i) => ({
+      id: `${id}:ep:${i+1}`, title: `Episode ${i+1}`, season: 1, episode: i+1, thumbnail: poster
+    }));
+    return { id, type: 'series', name, poster, posterShape: 'poster', description: d.description || d.synopsis || '', genres: d.genre ? String(d.genre).split(/[,|]/).map(clean).filter(Boolean) : [], videos };
+  } catch { return null; }
+}
+
 async function buildMeta(id) {
   const slug = seriesSlugFromId(id);
   const url = `${BASE}/series/${slug}`;
-  const m = parseMeta(await fetchHtml(url), url);
-  const videos = m.episodes.map(ep => ({
-    id: `${id}:ep:${ep.number}`,
-    title: ep.title || `Episode ${ep.number}`,
-    season: 1,
-    episode: ep.number,
-    thumbnail: m.poster
-  }));
-  return { id, type: 'series', name: m.title, poster: m.poster, posterShape: 'poster', description: m.description, genres: m.genres, videos };
+  try {
+    const m = parseMeta(await fetchHtml(url), url);
+    const videos = m.episodes.map(ep => ({ id: `${id}:ep:${ep.number}`, title: ep.title || `Episode ${ep.number}`, season: 1, episode: ep.number, thumbnail: m.poster }));
+    return { id, type: 'series', name: m.title, poster: m.poster, posterShape: 'poster', description: m.description, genres: m.genres, videos };
+  } catch {
+    const fallback = await publicSourceMeta(id);
+    if (fallback) return fallback;
+    throw new Error('No DramaExpress metadata and no public source match');
+  }
 }
 
 async function manifest() {
@@ -699,21 +800,26 @@ app.get('/stream/series/:id.json', async (req, res) => {
   try {
     const decodedId = decodeId(req.params.id);
     const [seriesId, epPart] = decodedId.split(':ep:');
+    const n = Number(epPart || 1);
+    const title = titleFromSeriesId(seriesId);
+    const publicStream = await publicSourceStream(title, n);
+    if (publicStream?.url) {
+      return res.json({ streams: [{
+        title: `${publicStream.provider} • Episode ${n}`,
+        url: proxyUrl(req, publicStream.url, `${PUBLIC_API_BASE}/${publicStream.provider}/`),
+        behaviorHints: { bingeGroup: `public:${publicStream.provider}:${seriesId}`, videoOrientation: 'portrait' }
+      }] });
+    }
+
+    // Last fallback: use the original DramaExpress resolver when reachable.
     const slug = seriesSlugFromId(seriesId);
     const pageUrl = `${BASE}/series/${slug}`;
     const m = parseMeta(await fetchHtml(pageUrl), pageUrl);
-    const n = Number(epPart || 1);
     const ep = m.episodes.find(x => x.number === n) || m.episodes[n - 1];
     if (!ep) return res.json({ streams: [] });
-
     const resolved = await resolveDramaExpressEpisode(ep.href, 0, new Set(), null, Date.now() + RESOLVE_DEADLINE_MS);
     if (!resolved?.url) return res.json({ streams: [] });
-
-    res.json({ streams: [{
-      title: ep.title || `Episode ${n}`,
-      url: proxyUrl(req, resolved.url, resolved.referer || ep.href),
-      behaviorHints: { bingeGroup: 'dramaexpress', videoOrientation: 'portrait' }
-    }] });
+    res.json({ streams: [{ title: ep.title || `Episode ${n}`, url: proxyUrl(req, resolved.url, resolved.referer || ep.href), behaviorHints: { bingeGroup: 'dramaexpress', videoOrientation: 'portrait' } }] });
   } catch (e) { res.status(502).json({ streams: [], error: e.message }); }
 });
 

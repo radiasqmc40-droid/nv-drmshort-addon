@@ -1,16 +1,32 @@
-# Nuvio DramaExpress Addon 1.8.6-test
+# NV Drama Short 1.9.0
 
-Bản test 1.8.6-test dùng để kiểm tra kết nối outbound từ Abasthan tới Internet và DramaExpress.
+Bản 1.9.0 ưu tiên nguồn phát public từ các provider short-drama thông qua một public REST gateway, thay vì phụ thuộc vào việc DramaExpress phải expose player trực tiếp.
 
-## Endpoints
+## Public playback providers
 
-- `/health` — kiểm tra addon đang chạy.
-- `/debug-network` — kiểm tra kết nối từ Abasthan tới Internet, DramaExpress homepage và Upgrade Episode 1.
-- `/debug-upstream` — kiểm tra upstream DramaExpress.
-- `/manifest.json` — manifest của addon.
+- DramaBox
+- FlareFlow
+- FlickReels
+- GoodShort
+- JoyReels
+- KalosTV
+- MoboReels
+- NetShort
+- Reelshort
+- Stardust
+- ShortWave
 
-## Mục đích
+Khi mở một tập, addon lấy tên phim từ ID/slug, tìm phim tương ứng trên các provider public ở trên, lấy stream của đúng episode rồi trả URL stream cho Nuvio. Nếu không tìm được public source, addon mới fallback về resolver DramaExpress cũ.
 
-Bản này ưu tiên chẩn đoán network trước khi tiếp tục sửa resolver/player.
+## Giữ danh sách source DramaExpress
 
-Các phép kiểm tra outbound có timeout ngắn để tránh endpoint debug tự treo quá lâu.
+Danh sách catalog gốc vẫn giữ các source đã yêu cầu:
+DramaBox, FlareFlow, FlickReels, GoodShort, JoyReels, KalosTV, MoboReels, MoreShort, MyDramaWave, NetShort, PetaDrama, Reelshort, Shortical, ShortTV, ShortWave, Stardust, StoryReel.
+
+FlexTV không được thêm.
+
+## Lưu ý
+
+Nguồn public gateway hiện không có đủ cả 17 provider trên; 11 provider ở trên có public playback API. Các provider còn lại vẫn được giữ trong danh sách DramaExpress nhưng chưa được giả mạo URL playback khi không có nguồn public tương ứng.
+
+Node 20+, PORT từ môi trường, bind 0.0.0.0.
