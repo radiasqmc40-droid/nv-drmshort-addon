@@ -1,6 +1,6 @@
 {
   "name": "nv-drmshort-addon",
-  "version": "1.8.5",
+  "version": "1.8.6-test",
   "private": true,
   "type": "module",
   "scripts": {

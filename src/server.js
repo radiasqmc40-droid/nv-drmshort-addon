@@ -2,7 +2,7 @@ import express from 'express';
 import * as cheerio from 'cheerio';
 
 const app = express();
-const VERSION = '1.8.5';
+const VERSION = '1.8.6-test';
 const PORT = Number(process.env.PORT) || 3000;
 const BASE = 'https://dramaexpress.net';
 const UA = `Mozilla/5.0 (compatible; Nuvio-DramaExpress-Addon/${VERSION})`;
@@ -715,6 +715,26 @@ app.get('/stream/series/:id.json', async (req, res) => {
       behaviorHints: { bingeGroup: 'dramaexpress', videoOrientation: 'portrait' }
     }] });
   } catch (e) { res.status(502).json({ streams: [], error: e.message }); }
+});
+
+app.get('/debug-network', async (req, res) => {
+  const started = Date.now();
+  const targets = [
+    { name: 'internet', url: 'https://example.com/' },
+    { name: 'dramaexpress_root', url: BASE + '/' },
+    { name: 'dramaexpress_episode', url: BASE + '/series/upgrade/episode-1' }
+  ];
+  const results = await Promise.all(targets.map(async ({ name, url }) => {
+    const r = await testUpstream(url);
+    return { name, url, ...r };
+  }));
+  res.json({
+    ok: true,
+    version: VERSION,
+    totalMs: Date.now() - started,
+    timeoutPerTestMs: DEBUG_FETCH_TIMEOUT_MS,
+    tests: results
+  });
 });
 
 app.get('/debug-upstream', async (req, res) => {
